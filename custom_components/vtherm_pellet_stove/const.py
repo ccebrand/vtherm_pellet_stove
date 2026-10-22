@@ -8,6 +8,9 @@ from __future__ import annotations
 
 DOMAIN = "vtherm_pellet_stove"
 NAME = "Versatile Thermostat Pellet Stove"
+SERVICE_RESET = "reset"
+DATA_HANDLERS = "handlers"
+DATA_LOADED_ENTRIES = "loaded_entries"
 
 #: Name used to register the algorithm factory in VThermAPI.
 PROP_FUNCTION_PELLET_REGULATION = "pellet_regulation"

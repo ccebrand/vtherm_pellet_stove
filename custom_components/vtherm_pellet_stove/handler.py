@@ -7,6 +7,8 @@ import asyncio
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.core import Context
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.storage import Store
 from homeassistant.util import slugify
 from vtherm_api.log_collector import get_vtherm_logger
@@ -28,6 +30,7 @@ from .const import (
     CONF_SAFETY_ROOM_TEMP,
     CONF_TARGET_VTHERM,
     DATA_DEBUG_SENSORS_PREFIX,
+    DATA_HANDLERS,
     DATA_SENSOR_ADD_CB,
     DEFAULT_OPTIONS,
     DOMAIN,
@@ -130,6 +133,10 @@ class PelletRegulationHandler:
         self._last_applied_level_index: int | None = None
         self._debug_sensor: PelletDebugSensor | None = None
         self._last_energy_at: datetime | None = None
+        self._control_lock = asyncio.Lock()
+        self._reset_lock = asyncio.Lock()
+        self._resetting = False
+        self._removed = False
         _LOGGER.debug("%s - __init__: handler created", self._thermostat.name)
 
     # ------------------------------------------------------------------
@@ -282,9 +289,66 @@ class PelletRegulationHandler:
                 self._controller.state.is_heating = False
 
         await self.on_state_changed(True)
+        if not self._removed:
+            self._thermostat.hass.data.setdefault(DOMAIN, {}).setdefault(
+                DATA_HANDLERS, {}
+            )[self._thermostat.unique_id] = self
+
+    async def async_reset(self, context: Context | None = None) -> None:
+        """Stop the VTherm before clearing and persisting regulation history."""
+        async with self._reset_lock:
+            if self._removed or self._controller is None or self._store is None:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN, translation_key="reset_not_ready"
+                )
+            self._resetting = True
+            try:
+                async with self._control_lock:
+                    if self._scheduler is not None and self._scheduler.is_cycle_running:
+                        await self._scheduler.cancel_cycle()
+                if str(self._thermostat.vtherm_hvac_mode).lower() != HVAC_MODE_OFF:
+                    await self._thermostat.hass.services.async_call(
+                        "climate",
+                        "set_hvac_mode",
+                        {
+                            "entity_id": self._thermostat.entity_id,
+                            "hvac_mode": HVAC_MODE_OFF,
+                        },
+                        blocking=True,
+                        context=context,
+                    )
+                async with self._control_lock:
+                    if self._removed:
+                        raise ServiceValidationError(
+                            translation_domain=DOMAIN, translation_key="reset_not_ready"
+                        )
+                    if str(self._thermostat.vtherm_hvac_mode).lower() != HVAC_MODE_OFF:
+                        raise HomeAssistantError(
+                            translation_domain=DOMAIN, translation_key="reset_not_off"
+                        )
+                    self._controller.reset()
+                    self._last_applied_level_index = None
+                    self._last_energy_at = None
+                    self._thermostat.update_custom_attributes()
+                    self._thermostat.async_write_ha_state()
+                    if self._debug_sensor is not None:
+                        self._debug_sensor.update_from_controller(self._controller)
+                    try:
+                        await self._store.async_save(self._controller.save_state())
+                    except (HomeAssistantError, OSError) as err:
+                        raise HomeAssistantError(
+                            translation_domain=DOMAIN,
+                            translation_key="reset_save_failed",
+                        ) from err
+            finally:
+                self._resetting = False
 
     def remove(self) -> None:
         """Persist current state and release resources."""
+        self._removed = True
+        handlers = self._thermostat.hass.data.get(DOMAIN, {}).get(DATA_HANDLERS, {})
+        if handlers.get(self._thermostat.unique_id) is self:
+            handlers.pop(self._thermostat.unique_id)
         _LOGGER.debug("%s - remove: start", self._thermostat.name)
         if self._controller is None or self._store is None:
             _LOGGER.debug(
@@ -293,7 +357,7 @@ class PelletRegulationHandler:
             )
             return
 
-        coro = self._store.async_save(self._controller.save_state())
+        coro = self._async_save_removed_state()
         hass = self._thermostat.hass
         if hasattr(hass, "async_create_task"):
             hass.async_create_task(coro)
@@ -318,7 +382,28 @@ class PelletRegulationHandler:
         # until the handler restarts).
         self._debug_sensor = None
 
+    async def _async_save_removed_state(self) -> None:
+        """Wait for in-flight control before saving the final handler state."""
+        async with self._control_lock:
+            handlers = self._thermostat.hass.data.get(DOMAIN, {}).get(DATA_HANDLERS, {})
+            if handlers.get(self._thermostat.unique_id) not in (None, self):
+                return
+            if self._store is not None and self._controller is not None:
+                await self._store.async_save(self._controller.save_state())
+
     async def control_heating(
+        self,
+        timestamp: datetime | None = None,
+        force: bool = False,
+    ) -> None:
+        """Serialize control and skip callbacks during reset or removal."""
+
+        async with self._control_lock:
+            if self._resetting or self._removed:
+                return
+            await self._async_control_heating(timestamp, force)
+
+    async def _async_control_heating(
         self,
         timestamp: datetime | None = None,
         force: bool = False,

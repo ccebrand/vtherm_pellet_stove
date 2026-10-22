@@ -58,6 +58,20 @@ Le plugin utilise l'API publique [vtherm_api](https://github.com/KipK/vtherm_api
 2. Redémarrer Home Assistant.
 3. Ajouter l'intégration depuis **Paramètres → Appareils et services**.
 
+## Réinitialiser la régulation pellet
+
+Pour une récupération exceptionnelle, appeler `vtherm_pellet_stove.reset` depuis **Outils de développement > Actions**, en ciblant exactement un VTherm utilisant `pellet_regulation` :
+
+```yaml
+action: vtherm_pellet_stove.reset
+data:
+  entity_id: climate.votre_vtherm_pellet
+```
+
+L'action passe le VTherm sur OFF, puis efface son statut logiciel de chauffe, les dates de transition, le boost et l'historique du niveau de puissance. Le capteur de diagnostic affiche immédiatement `off` et `next_action_allowed_at: null`. Le reset est sauvegardé pour le prochain redémarrage de Home Assistant. Le VTherm reste sur OFF ; le remettre manuellement sur HEAT au moment approprié. La configuration, les seuils de sécurité thermique et l'énergie cumulée sont conservés.
+
+**Attention :** cette action supprime volontairement les délais logiciels d'arrêt minimal et de refroidissement, dès le succès de la commande d'arrêt. Elle n'attend pas le refroidissement physique, ne réinitialise pas les défauts du poêle et ne contourne pas ses protections matérielles. Vérifier que le poêle peut redémarrer sans risque avant de sélectionner HEAT. Si l'arrêt échoue ou si le VTherm refuse OFF, l'historique de régulation n'est pas effacé. Une erreur de sauvegarde est signalée car le reset pourrait ne pas survivre à un redémarrage. Aucun autre thermostat n'est commandé.
+
 ## Documentation
 
 - 🇬🇧 [User documentation](documentation/en/vtherm_pellet_stove.md)

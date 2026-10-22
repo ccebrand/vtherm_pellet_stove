@@ -60,6 +60,20 @@ The plugin relies on the public [vtherm_api](https://github.com/KipK/vtherm_api)
 2. Restart Home Assistant.
 3. Add the integration from **Settings → Devices & Services**.
 
+## Reset pellet regulation
+
+For exceptional recovery, call `vtherm_pellet_stove.reset` from **Developer Tools > Actions** with exactly one VTherm using `pellet_regulation`:
+
+```yaml
+action: vtherm_pellet_stove.reset
+data:
+  entity_id: climate.your_pellet_vtherm
+```
+
+The action switches the VTherm to OFF, then clears its software heating status, transition timestamps, boost and power-level history. The diagnostic sensor immediately shows `off` and `next_action_allowed_at: null`. The reset is saved for the next Home Assistant restart. The VTherm remains OFF; switch it back to HEAT manually when appropriate. Configuration, temperature safety thresholds and accumulated energy are preserved.
+
+**Warning:** this deliberately removes software minimum-off and cooldown delays, immediately after the stop command succeeds. It does not wait for physical cooling, reset stove faults or override hardware protections. Ensure the stove is safe to restart before selecting HEAT. If the stop fails or the VTherm refuses OFF, the regulation history is not cleared. A save failure is reported because the reset might not survive a restart. No command is sent to unrelated thermostats.
+
 ## Documentation
 
 - 🇬🇧 [User documentation](documentation/en/vtherm_pellet_stove.md)

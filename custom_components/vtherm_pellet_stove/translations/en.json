@@ -1,5 +1,34 @@
 {
     "title": "Versatile Thermostat Pellet Stove",
+    "services": {
+        "reset": {
+            "name": "Reset pellet regulation",
+            "description": "Stop one pellet VTherm and clear its regulation history and software cooldown. The VTherm remains OFF. This does not confirm physical cooling or reset stove faults.",
+            "fields": {
+                "entity_id": {
+                    "name": "Thermostat",
+                    "description": "One VTherm using the pellet regulation algorithm."
+                }
+            }
+        }
+    },
+    "exceptions": {
+        "invalid_reset_target": {
+            "message": "Select one active VTherm using the pellet regulation algorithm."
+        },
+        "reset_target_unavailable": {
+            "message": "The selected thermostat is unavailable. No reset was performed."
+        },
+        "reset_not_ready": {
+            "message": "The pellet thermostat is not ready or has been unloaded. No reset was performed."
+        },
+        "reset_not_off": {
+            "message": "The VTherm did not switch to OFF. Its regulation history was not reset. Check whether it is locked."
+        },
+        "reset_save_failed": {
+            "message": "The VTherm is OFF and its regulation was reset, but saving failed. The reset may not survive a restart."
+        }
+    },
     "entity": {
         "sensor": {
             "pellet_debug": {
