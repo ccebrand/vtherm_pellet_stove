@@ -1,5 +1,34 @@
 {
     "title": "Versatile Thermostat Poêle à Pellets",
+    "services": {
+        "reset": {
+            "name": "Réinitialiser la régulation pellet",
+            "description": "Arrête un VTherm pellet et efface son historique de régulation et son refroidissement logiciel. Le VTherm reste sur OFF. Ne confirme pas le refroidissement physique et ne réinitialise pas les défauts du poêle.",
+            "fields": {
+                "entity_id": {
+                    "name": "Thermostat",
+                    "description": "Un seul VTherm utilisant l'algorithme de régulation pellet."
+                }
+            }
+        }
+    },
+    "exceptions": {
+        "invalid_reset_target": {
+            "message": "Sélectionnez un VTherm actif utilisant l'algorithme de régulation pellet."
+        },
+        "reset_target_unavailable": {
+            "message": "Le thermostat sélectionné est indisponible. Aucune réinitialisation effectuée."
+        },
+        "reset_not_ready": {
+            "message": "Le thermostat pellet n'est pas prêt ou a été déchargé. Aucune réinitialisation effectuée."
+        },
+        "reset_not_off": {
+            "message": "Le VTherm n'est pas passé sur OFF. Son historique de régulation n'a pas été réinitialisé. Vérifiez son verrouillage."
+        },
+        "reset_save_failed": {
+            "message": "Le VTherm est sur OFF et sa régulation a été réinitialisée, mais la sauvegarde a échoué. Le reset risque de ne pas survivre à un redémarrage."
+        }
+    },
     "entity": {
         "sensor": {
             "pellet_debug": {

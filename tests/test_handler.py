@@ -18,6 +18,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.vtherm_pellet_stove.const import (
     CONF_COOLDOWN_DURATION_MIN,
@@ -31,6 +32,7 @@ from custom_components.vtherm_pellet_stove.const import (
     CONF_SAFETY_ROOM_TEMP,
     CONF_TARGET_VTHERM,
     DATA_DEBUG_SENSORS_PREFIX,
+    DATA_HANDLERS,
     DATA_SENSOR_ADD_CB,
     DEFAULT_OPTIONS,
     DOMAIN,
@@ -58,6 +60,7 @@ def _make_entry(data: dict, options: dict | None = None, unique_id: str = DOMAIN
 def _make_hass(entries: list | None = None):
     """Construit un faux HomeAssistant avec config_entries et services."""
     hass = MagicMock()
+    hass.data = {}
     hass.config_entries.async_entries = MagicMock(return_value=entries or [])
     hass.services.async_call = AsyncMock()
 
@@ -87,6 +90,7 @@ def _make_thermostat(
     thermostat.hass = hass
     thermostat.unique_id = unique_id
     thermostat.name = name
+    thermostat.entity_id = "climate.test_vtherm"
     thermostat.target_temperature = target_temperature
     thermostat.current_temperature = current_temperature
     thermostat.last_temperature_slope = last_temperature_slope
@@ -141,6 +145,190 @@ def _mock_store(handler: PelletRegulationHandler, load_data: dict | None = None)
     handler._store.async_load = AsyncMock(return_value=load_data)
     handler._store.async_save = AsyncMock()
     return handler._store
+
+
+async def test_reset_stops_before_clearing_and_saves():
+    """OFF callbacks cannot restart regulation or send duplicate commands."""
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass)
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    save = AsyncMock()
+    handler._store.async_save = save
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+    await handler.control_heating(timestamp=_now())
+    handler._debug_sensor = MagicMock()
+    handler._last_applied_level_index = 2
+    original_state = handler._controller.save_state()
+    scheduler.start_cycle.reset_mock()
+
+    async def stop(*_args, **_kwargs):
+        assert handler._controller.save_state() == original_state
+        thermostat.vtherm_hvac_mode = "off"
+        await handler.control_heating()
+
+    hass.services.async_call.side_effect = stop
+    await handler.async_reset()
+
+    hass.services.async_call.assert_awaited_once_with(
+        "climate",
+        "set_hvac_mode",
+        {"entity_id": thermostat.entity_id, "hvac_mode": "off"},
+        blocking=True,
+        context=None,
+    )
+    assert thermostat.vtherm_hvac_mode == "off"
+    assert handler._controller.last_reason == "reset"
+    assert handler._controller.current_phase() == "off"
+    assert handler._controller.get_debug_attributes()["next_action_allowed_at"] is None
+    assert handler._last_applied_level_index is None
+    assert handler._last_energy_at is None
+    save.assert_awaited_with(handler._controller.save_state())
+    handler._debug_sensor.update_from_controller.assert_called_once()
+    scheduler.start_cycle.assert_not_awaited()
+    await handler.async_reset()
+    assert hass.services.async_call.await_count == 1
+
+
+async def test_reset_failure_does_not_clear_history():
+    """An unsuccessful stop must not lift software guard rails."""
+    hass = _make_hass()
+    handler = PelletRegulationHandler(_make_thermostat(hass))
+    handler.init_algorithm()
+    await handler.control_heating(timestamp=_now())
+    state = handler._controller.save_state()
+    hass.services.async_call.side_effect = RuntimeError("stop failed")
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        await handler.async_reset()
+
+    assert handler._controller.save_state() == state
+    assert not handler._resetting
+
+
+async def test_handler_registry_survives_old_handler_removal():
+    """Removal of a replaced handler must not remove its successor."""
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass, vtherm_hvac_mode="off")
+    old = PelletRegulationHandler(thermostat)
+    new = PelletRegulationHandler(thermostat)
+    for handler in (old, new):
+        handler.init_algorithm()
+        await handler.async_startup()
+    old.remove()
+    assert hass.data[DOMAIN][DATA_HANDLERS][thermostat.unique_id] is new
+    new.remove()
+    assert hass.data[DOMAIN][DATA_HANDLERS] == {}
+
+
+async def test_reset_does_not_clear_history_if_off_is_refused():
+    """A locked thermostat may accept the service call without changing mode."""
+    hass = _make_hass()
+    handler = PelletRegulationHandler(_make_thermostat(hass))
+    handler.init_algorithm()
+    await handler.control_heating(timestamp=_now())
+    state = handler._controller.save_state()
+    with pytest.raises(HomeAssistantError) as error:
+        await handler.async_reset()
+    assert error.value.translation_key == "reset_not_off"
+    assert handler._controller.save_state() == state
+    assert not handler._resetting
+
+
+async def test_reset_reports_save_failure_without_restarting():
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass, vtherm_hvac_mode="off")
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    handler._store.async_save.side_effect = OSError("disk unavailable")
+    with pytest.raises(HomeAssistantError) as error:
+        await handler.async_reset()
+    assert error.value.translation_key == "reset_save_failed"
+    assert handler._controller.last_reason == "reset"
+    assert thermostat.vtherm_hvac_mode == "off"
+    assert not handler._resetting
+    hass.services.async_call.assert_not_awaited()
+
+
+async def test_reset_waits_for_inflight_control_save():
+    """A previous cycle cannot overwrite the reset with its old snapshot."""
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass)
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    saving = asyncio.Event()
+    release = asyncio.Event()
+    operations = []
+
+    async def save(data):
+        if data["last_reason"] != "reset":
+            saving.set()
+            await release.wait()
+            operations.append("save_control")
+        else:
+            operations.append("save_reset")
+
+    async def stop(*_args, **_kwargs):
+        operations.append("stop")
+        thermostat.vtherm_hvac_mode = "off"
+
+    handler._store.async_save.side_effect = save
+    hass.services.async_call.side_effect = stop
+    control = asyncio.create_task(handler.control_heating(timestamp=_now()))
+    await saving.wait()
+    reset = asyncio.create_task(handler.async_reset())
+    release.set()
+    await asyncio.gather(control, reset)
+    assert operations == ["save_control", "stop", "save_reset"]
+    assert handler._controller.last_reason == "reset"
+
+
+async def test_control_skipped_during_stop_and_reset_calls_serialized():
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass)
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    scheduler = _make_scheduler()
+    scheduler.is_cycle_running = True
+    handler.on_scheduler_ready(scheduler)
+    stopping = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stop(*_args, **_kwargs):
+        stopping.set()
+        await release.wait()
+        thermostat.vtherm_hvac_mode = "off"
+
+    hass.services.async_call.side_effect = stop
+    reset = asyncio.create_task(handler.async_reset())
+    await stopping.wait()
+    await handler.control_heating(timestamp=_now())
+    scheduler.start_cycle.assert_not_awaited()
+    second_reset = asyncio.create_task(handler.async_reset())
+    release.set()
+    await asyncio.gather(reset, second_reset)
+    hass.services.async_call.assert_awaited_once()
+    assert handler._controller.last_reason == "reset"
+    assert not handler._resetting
+
+
+async def test_unload_during_stop_prevents_reset_of_removed_handler():
+    hass = _make_hass()
+    thermostat = _make_thermostat(hass)
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    handler._controller.state.last_off_at = _now()
+
+    async def stop(*_args, **_kwargs):
+        thermostat.vtherm_hvac_mode = "off"
+        handler.remove()
+
+    hass.services.async_call.side_effect = stop
+    with pytest.raises(ServiceValidationError):
+        await handler.async_reset()
+    assert handler._controller.state.last_off_at == _now()
+    assert not handler._resetting
 
 
 # ===========================================================================

@@ -1,0 +1,10 @@
+reset:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          filter:
+            - domain: climate
+              integration: versatile_thermostat
+          multiple: false

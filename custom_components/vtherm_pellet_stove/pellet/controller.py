@@ -219,6 +219,15 @@ class PelletRegulationController:
         """Sérialise l'état pour le Store HA."""
         return self._state.save_state()
 
+    def reset(self) -> None:
+        """Clear runtime history after the thermostat has been stopped."""
+        self._state = PelletState(last_reason="reset")
+        self._last_decision = PelletDecision(
+            on_percent=self._min_on_percent,
+            reason="reset",
+        )
+        self._previous_target = None
+
     async def on_cycle_started(
         self,
         on_time_sec: float,

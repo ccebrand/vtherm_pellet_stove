@@ -62,6 +62,38 @@ def _make_ctrl(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("heating", [False, True])
+def test_reset_clears_history_and_preserves_safety(heating: bool) -> None:
+    """Reset removes software delays and boost without disabling safety."""
+    ctrl = _make_ctrl(min_on_percent=0.1)
+    now = _now()
+    ctrl.calculate(target_temp=20, current_temp=18, now=now)
+    ctrl.calculate(target_temp=22, current_temp=18, now=now)
+    ctrl.state.is_heating = heating
+    ctrl.state.last_off_at = now
+
+    ctrl.reset()
+    ctrl.reset()
+
+    assert ctrl.current_phase(now) == "off"
+    assert ctrl.on_percent == pytest.approx(0.1)
+    assert ctrl.get_debug_attributes(now)["next_action_allowed_at"] is None
+    assert ctrl.save_state() == {
+        "is_heating": False,
+        "current_level_index": None,
+        "last_on_at": None,
+        "last_off_at": None,
+        "last_reason": "reset",
+        "boost_until": None,
+    }
+    restored = _make_ctrl()
+    restored.restore_state(ctrl.save_state())
+    assert restored.save_state() == ctrl.save_state()
+    assert ctrl.calculate(target_temp=20, current_temp=18, now=now) == 1.0
+    assert ctrl.calculate(target_temp=30, current_temp=27, now=now) == 0.1
+    assert ctrl.last_reason == "safety"
+
+
 def test_scenario_1_ignition_below_threshold() -> None:
     """current ≤ target − hysteresis_on → on_percent = max, reason=below_on_threshold."""
     ctrl = _make_ctrl()

@@ -5,9 +5,18 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import voluptuous as vol
+from homeassistant.auth.permissions.const import POLICY_CONTROL
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    Platform,
+)
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall
+from homeassistant.exceptions import ServiceValidationError, Unauthorized, UnknownUser
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from vtherm_api.log_collector import get_vtherm_logger
 from vtherm_api.vtherm_api import VThermAPI
 
@@ -15,8 +24,11 @@ from .const import (
     CONF_PROP_FUNCTION,
     CONF_TARGET_VTHERM,
     DATA_FACTORY_REGISTERED,
+    DATA_HANDLERS,
+    DATA_LOADED_ENTRIES,
     DOMAIN,
     PROP_FUNCTION_PELLET_REGULATION,
+    SERVICE_RESET,
 )
 from .factory import PelletRegulationFactory
 
@@ -32,6 +44,47 @@ _LOGGER = get_vtherm_logger(__name__)
 def _ensure_domain_data(hass: HomeAssistant) -> dict[str, Any]:
     """Return the plugin data storage in hass."""
     return hass.data.setdefault(DOMAIN, {})
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register reset once for all active pellet thermostats."""
+    if hass.services.has_service(DOMAIN, SERVICE_RESET):
+        return
+
+    async def async_reset(call: ServiceCall) -> None:
+        entity_id = call.data[ATTR_ENTITY_ID]
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.permissions.check_entity(entity_id, POLICY_CONTROL):
+                raise Unauthorized(context=call.context, entity_id=entity_id)
+
+        entry = er.async_get(hass).async_get(entity_id)
+        handlers = _ensure_domain_data(hass).get(DATA_HANDLERS, {})
+        handler = handlers.get(entry.unique_id) if entry is not None else None
+        state = hass.states.get(entity_id)
+        if (
+            entry is None
+            or entry.platform != VT_DOMAIN
+            or not entity_id.startswith("climate.")
+            or handler is None
+        ):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="invalid_reset_target"
+            )
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="reset_target_unavailable"
+            )
+        await handler.async_reset(call.context)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET,
+        async_reset,
+        schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id}),
+    )
 
 
 def _register_factory(hass: HomeAssistant) -> bool:
@@ -135,7 +188,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up vtherm_pellet_stove from a config entry."""
-    _ensure_domain_data(hass)[entry.entry_id] = entry.entry_id
+    data = _ensure_domain_data(hass)
     _register_factory(hass)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
@@ -150,6 +203,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if hass.state == CoreState.running:
         await _reload_pellet_vtherms(hass)
 
+    data[entry.entry_id] = entry.entry_id
+    data.setdefault(DATA_LOADED_ENTRIES, set()).add(entry.entry_id)
+    _register_services(hass)
     return True
 
 
@@ -167,15 +223,19 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a vtherm_pellet_stove config entry."""
     data = _ensure_domain_data(hass)
-    data.pop(entry.entry_id, None)
 
     # Décharger la plateforme sensor de l'entrée globale si applicable.
     if entry.unique_id == DOMAIN:
-        await hass.config_entries.async_unload_platforms(entry, _PLATFORMS)
+        if not await hass.config_entries.async_unload_platforms(entry, _PLATFORMS):
+            return False
         # Nettoyer le callback stocké.
         from .const import DATA_SENSOR_ADD_CB  # pylint: disable=import-outside-toplevel
 
         data.pop(DATA_SENSOR_ADD_CB, None)
+
+    data.pop(entry.entry_id, None)
+    loaded_entries = data.setdefault(DATA_LOADED_ENTRIES, set())
+    loaded_entries.discard(entry.entry_id)
 
     # Unregister the factory only when the last plugin entry is removed.
     # When it IS the last entry, also reload the VTherm thermostats so they
@@ -183,7 +243,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # entry reload (triggered by an options update) other plugin entries are
     # still present, so the factory stays registered and no VTherm reload is
     # needed here — async_setup_entry will handle it.
-    if not [key for key in data if key != DATA_FACTORY_REGISTERED]:
+    if not loaded_entries:
+        hass.services.async_remove(DOMAIN, SERVICE_RESET)
         _unregister_factory(hass)
         await _reload_pellet_vtherms(hass)
 

@@ -9,6 +9,8 @@
     "postStartCommand": "bash .devcontainer/bootstrap-python.sh",
     "mounts": [
         "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached",
+        // The common agents directory
+        "source=/Users/jmcollin/.copilot/agents,target=/home/vscode/.copilot/agents,type=bind",
         // the VTherm integration
         "source=/Users/jmcollin/SugarSync/Projets/home-assistant/versatile_thermostat/custom_components/versatile_thermostat,target=/workspaces/vtherm_pellet_stove/custom_components/versatile_thermostat,type=bind",
         // the VTherm integration

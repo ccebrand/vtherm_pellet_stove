@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `vtherm_pellet_stove.reset` action targeting one pellet VTherm: switch OFF, clear regulation history and software cooldown, persist and publish the reset, and leave restart to the user (#5).
+- English and French action labels, errors and usage documentation; reset, concurrency and Home Assistant service tests.
+
 ## [0.1.0] — 2026-04-26
 
 ### Added
