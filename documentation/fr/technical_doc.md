@@ -256,11 +256,11 @@ VTherm.async_control_heating
 
 ### Types de flux
 
-| Flux               | `unique_id`           | Objet                                                            |
-| ------------------ | --------------------- | ---------------------------------------------------------------- |
-| Defaults globaux   | `DOMAIN`              | Créé automatiquement à la première installation.                 |
-| Par thermostat     | `DOMAIN-<vtherm_uid>` | Surcharge optionnelle pour un thermostat spécifique.             |
-| Options (les deux) | n/a                   | Met à jour les handlers vivants sans reload VTherm.              |
+| Flux               | `unique_id`           | Objet                                                |
+| ------------------ | --------------------- | ---------------------------------------------------- |
+| Defaults globaux   | `DOMAIN`              | Créé automatiquement à la première installation.     |
+| Par thermostat     | `DOMAIN-<vtherm_uid>` | Surcharge optionnelle pour un thermostat spécifique. |
+| Options (les deux) | n/a                   | Met à jour les handlers vivants sans reload VTherm.  |
 
 ### Portée et application
 

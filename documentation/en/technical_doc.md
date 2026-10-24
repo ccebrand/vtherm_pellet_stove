@@ -90,16 +90,16 @@ Simple factory: `name = "pellet_regulation"`, `create(thermostat) → PelletRegu
 
 HA lifecycle adapter. Implements `InterfacePropAlgorithmHandler`:
 
-| Method                | Responsibility                                                                                                                               |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init_algorithm`      | Resolve effective options (`_resolve_options`), build `PelletRegulationController`, create `Store`.                                          |
-| `async_added_to_hass` | Load persistent state from `Store`, call `controller.restore_state`.                                                                         |
-| `async_startup`       | Trigger `on_state_changed(True)` → first `control_heating` iteration.                                                                        |
-| `remove`              | Schedule `store.async_save` via `hass.async_create_task`.                                                                                    |
+| Method                | Responsibility                                                                                                                                                                                                                |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_algorithm`      | Resolve effective options (`_resolve_options`), build `PelletRegulationController`, create `Store`.                                                                                                                           |
+| `async_added_to_hass` | Load persistent state from `Store`, call `controller.restore_state`.                                                                                                                                                          |
+| `async_startup`       | Trigger `on_state_changed(True)` → first `control_heating` iteration.                                                                                                                                                         |
+| `remove`              | Schedule `store.async_save` via `hass.async_create_task`.                                                                                                                                                                     |
 | `control_heating`     | Call `controller.calculate`, detect real state transitions (ON↔OFF), update `thermostat.prop_algorithm`, call `scheduler.start_cycle` with `force=True` on any real transition, apply power level, publish HA state, persist. |
-| `on_state_changed`    | Forward to `control_heating` when `changed=True`.                                                                                            |
-| `on_scheduler_ready`  | Store scheduler reference, register cycle callbacks.                                                                                         |
-| `_apply_power_level`  | Call `climate.set_fan_mode / set_preset_mode` on underlying climate entities. Anti-spam: skip if level unchanged.                            |
+| `on_state_changed`    | Forward to `control_heating` when `changed=True`.                                                                                                                                                                             |
+| `on_scheduler_ready`  | Store scheduler reference, register cycle callbacks.                                                                                                                                                                          |
+| `_apply_power_level`  | Call `climate.set_fan_mode / set_preset_mode` on underlying climate entities. Anti-spam: skip if level unchanged.                                                                                                             |
 
 **Option resolution** (`_resolve_options`):
 
@@ -256,11 +256,11 @@ VTherm.async_control_heating
 
 ### Flow types
 
-| Flow            | `unique_id`           | Purpose                                           |
-| --------------- | --------------------- | ------------------------------------------------- |
-| Global defaults | `DOMAIN`              | Created automatically on first install.           |
-| Per-thermostat  | `DOMAIN-<vtherm_uid>` | Optional override for a specific thermostat.      |
-| Options (both)  | n/a                   | Updates live handlers without a VTherm reload.   |
+| Flow            | `unique_id`           | Purpose                                        |
+| --------------- | --------------------- | ---------------------------------------------- |
+| Global defaults | `DOMAIN`              | Created automatically on first install.        |
+| Per-thermostat  | `DOMAIN-<vtherm_uid>` | Optional override for a specific thermostat.   |
+| Options (both)  | n/a                   | Updates live handlers without a VTherm reload. |
 
 ### Scope and application
 
@@ -351,16 +351,16 @@ def _patch_ha_store():
 
 The `PelletRegulationController` emits HA-compatible logs according to this matrix:
 
-| Level     | Condition                                         | Example                                                                                        |
-| --------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `WARNING` | Safety high-temp → forced shutdown                | `Living Room - SAFETY: room temp 27.2°C ≥ 26.0°C → forced shutdown after 45 min of heating`    |
-| `INFO`    | Real ignition (OFF → ON transition)               | `Living Room - Stove ignited (reason=below_on_threshold) after 27 min off [target=20.0 …]`     |
-| `INFO`    | Real shutdown (ON → OFF transition)               | `Living Room - Stove off (reason=above_off_threshold) after 32 min of heating [target=20.0 …]` |
-| `INFO`    | Shutdown delayed by `min_on` guard-rail           | `Living Room - Shutdown delayed (min_on guard): 15/30 min of heating`                          |
-| `INFO`    | Ignition delayed by `min_off+cooldown` guard-rail | `Living Room - Ignition delayed (min_off+cooldown guard): 18/25 min off`                       |
+| Level     | Condition                                         | Example                                                                                               |
+| --------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `WARNING` | Safety high-temp → forced shutdown                | `Living Room - SAFETY: room temp 27.2°C ≥ 26.0°C → forced shutdown after 45 min of heating`           |
+| `INFO`    | Real ignition (OFF → ON transition)               | `Living Room - Stove ignited (reason=below_on_threshold) after 27 min off [target=20.0 …]`            |
+| `INFO`    | Real shutdown (ON → OFF transition)               | `Living Room - Stove off (reason=above_off_threshold) after 32 min of heating [target=20.0 …]`        |
+| `INFO`    | Shutdown delayed by `min_on` guard-rail           | `Living Room - Shutdown delayed (min_on guard): 15/30 min of heating`                                 |
+| `INFO`    | Ignition delayed by `min_off+cooldown` guard-rail | `Living Room - Ignition delayed (min_off+cooldown guard): 18/25 min off`                              |
 | `INFO`    | ON→OFF transition → immediate cycle stop forced   | `Living Room - ON→OFF transition detected (reason=above_off_threshold): forcing immediate cycle stop` |
 | `INFO`    | OFF→ON transition → immediate cycle start forced  | `Living Room - OFF→ON transition detected (reason=below_on_threshold): forcing immediate cycle start` |
-| `DEBUG`   | Every `calculate()` call                          | `PelletController - calculate target=20.0 current=19.3 on_percent=1.0 …`                       |
+| `DEBUG`   | Every `calculate()` call                          | `PelletController - calculate target=20.0 current=19.3 on_percent=1.0 …`                              |
 
 `INFO` and `WARNING` logs are only emitted on a state change or a guard-rail block (anti-spam).
 

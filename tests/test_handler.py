@@ -13,6 +13,7 @@ Scénario 10 : Redémarrage HA avec ``is_heating=True`` stocké dans le Store �
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
@@ -38,6 +39,7 @@ from custom_components.vtherm_pellet_stove.const import (
     DATA_SENSOR_REGISTERED,
     DEFAULT_OPTIONS,
     DOMAIN,
+    EVENT_SETTINGS_UPDATED,
 )
 from custom_components.vtherm_pellet_stove.handler import (
     PelletRegulationHandler,
@@ -555,6 +557,151 @@ class TestScenario7OptionsUpdate:
             "next_action_allowed_at"
         ] == (now - timedelta(minutes=7) + timedelta(minutes=42)).isoformat()
         scheduler.start_cycle.assert_not_awaited()
+
+    async def test_live_options_update_fires_settings_event_only_for_changes(
+        self, caplog
+    ):
+        """Publish changed effective options once with the VTherm identity."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        hass.states.async_set("climate.test_vtherm", "heat", {"temperature": 21.0})
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        hass.bus.async_fire.assert_not_called()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with caplog.at_level(logging.INFO):
+            assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+        info_records = [
+            record for record in caplog.records if record.levelno == logging.INFO
+        ]
+        assert len(info_records) == 1
+        assert "Test VTherm" in info_records[0].message
+        assert EVENT_SETTINGS_UPDATED in info_records[0].message
+        assert "'min_on_duration_min': 42" in info_records[0].message
+        event_type, event_data = hass.bus.async_fire.call_args.args
+        assert event_type == EVENT_SETTINGS_UPDATED
+        assert event_data == {
+            "entity_id": "climate.test_vtherm",
+            "name": "Test VTherm",
+            "state": "heat",
+            "state_attributes": {"temperature": 21.0},
+            "configuration": {
+                **DEFAULT_OPTIONS,
+                CONF_MIN_ON_DURATION_MIN: 42,
+            },
+        }
+
+        with caplog.at_level(logging.INFO):
+            assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+        assert (
+            len([record for record in caplog.records if record.levelno == logging.INFO])
+            == 1
+        )
+
+    async def test_live_options_update_does_not_fire_event_on_failure(self):
+        """Do not publish an update when applying the controller config fails."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with patch.object(
+            handler._controller,
+            "update_configuration",
+            side_effect=RuntimeError("configuration failed"),
+        ):
+            with pytest.raises(RuntimeError, match="configuration failed"):
+                await handler.async_update_options()
+
+        hass.bus.async_fire.assert_not_called()
+        assert (
+            handler._opts[CONF_MIN_ON_DURATION_MIN]
+            == DEFAULT_OPTIONS[CONF_MIN_ON_DURATION_MIN]
+        )
+        assert (
+            handler._controller._guard.min_on_duration_min
+            == DEFAULT_OPTIONS[CONF_MIN_ON_DURATION_MIN]
+        )
+        assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+
+    async def test_live_options_update_keeps_applied_options_when_bus_fails(self):
+        """A bus error is logged without reverting an applied configuration."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with (
+            patch.object(
+                hass.bus,
+                "async_fire",
+                side_effect=RuntimeError("bus unavailable"),
+            ) as fire_event,
+            patch(
+                "custom_components.vtherm_pellet_stove.handler._LOGGER.exception"
+            ) as log_exception,
+        ):
+            assert await handler.async_update_options()
+            fire_event.assert_called_once()
+            log_exception.assert_called_once()
+
+            assert handler._opts[CONF_MIN_ON_DURATION_MIN] == 42
+            assert handler._controller._guard.min_on_duration_min == 42
+            assert await handler.async_update_options()
+            fire_event.assert_called_once()
+
+    async def test_live_options_update_notifies_even_when_control_fails(self, caplog):
+        """A control error propagates after options are applied and notified."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        handler.on_scheduler_ready(_make_scheduler())
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(
+                handler,
+                "_async_control_heating",
+                side_effect=RuntimeError("control failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="control failed"):
+                await handler.async_update_options()
+
+            assert handler._opts[CONF_MIN_ON_DURATION_MIN] == 42
+            assert handler._controller._guard.min_on_duration_min == 42
+            hass.bus.async_fire.assert_called_once()
+            assert not [
+                record for record in caplog.records if record.levelno == logging.INFO
+            ]
+
+            with pytest.raises(RuntimeError, match="control failed"):
+                await handler.async_update_options()
+            hass.bus.async_fire.assert_called_once()
 
     async def test_duration_only_options_update_does_not_reapply_power_level(self):
         """Changing a guard duration must not resend an unchanged power level."""

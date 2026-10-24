@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +35,7 @@ from .const import (
     DATA_SENSOR_REGISTERED,
     DEFAULT_OPTIONS,
     DOMAIN,
+    EVENT_SETTINGS_UPDATED,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -199,6 +200,7 @@ class PelletRegulationHandler:
             options = _resolve_options(
                 self._thermostat.hass, self._thermostat.unique_id
             )
+            previous_options = deepcopy(self._opts)
             previous_power_enabled = bool(
                 self._opts.get(CONF_POWER_CONTROL_ENABLED)
             )
@@ -207,7 +209,6 @@ class PelletRegulationHandler:
             )
             previous_level_index = self._controller.current_level_index
             previous_level_value = self._controller.current_level_value
-            self._opts = options
             self._controller.update_configuration(
                 hysteresis_on=float(options[CONF_HYSTERESIS_ON]),
                 hysteresis_off=float(options[CONF_HYSTERESIS_OFF]),
@@ -227,6 +228,7 @@ class PelletRegulationHandler:
                     options[CONF_POWER_BOOST_DURATION_MIN]
                 ),
             )
+            self._opts = options
             power_configuration_changed = (
                 previous_power_enabled
                 != bool(options[CONF_POWER_CONTROL_ENABLED])
@@ -239,8 +241,46 @@ class PelletRegulationHandler:
                 self._last_applied_level_index = None
             if self._debug_sensor is not None:
                 self._debug_sensor.update_from_controller(self._controller)
-            if self._scheduler is not None:
-                await self._async_control_heating()
+            control_succeeded = False
+            try:
+                if self._scheduler is not None:
+                    await self._async_control_heating()
+                control_succeeded = True
+            finally:
+                if previous_options != options:
+                    thermostat_state = self._thermostat.hass.states.get(
+                        self._thermostat.entity_id
+                    )
+                    event_data = {
+                        "entity_id": self._thermostat.entity_id,
+                        "name": self._thermostat.name,
+                        "state": (thermostat_state.state if thermostat_state else None),
+                        "state_attributes": (
+                            dict(thermostat_state.attributes)
+                            if thermostat_state
+                            else {}
+                        ),
+                        "configuration": {
+                            key: deepcopy(options[key]) for key in DEFAULT_OPTIONS
+                        },
+                    }
+                    try:
+                        self._thermostat.hass.bus.async_fire(
+                            EVENT_SETTINGS_UPDATED,
+                            event_data,
+                        )
+                        if control_succeeded:
+                            _LOGGER.info(
+                                "%s - Sending event %s with data: %s",
+                                self._thermostat.name,
+                                EVENT_SETTINGS_UPDATED,
+                                event_data["configuration"],
+                            )
+                    except Exception:  # pylint: disable=broad-except
+                        _LOGGER.exception(
+                            "%s - Failed to publish settings updated event",
+                            self._thermostat.name,
+                        )
             return True
 
     async def async_added_to_hass(self) -> None:

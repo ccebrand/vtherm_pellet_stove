@@ -9,6 +9,7 @@ from __future__ import annotations
 DOMAIN = "vtherm_pellet_stove"
 NAME = "Versatile Thermostat Pellet Stove"
 SERVICE_RESET = "reset"
+EVENT_SETTINGS_UPDATED = "versatile_thermostat_pellet_settings_event"
 DATA_HANDLERS = "handlers"
 DATA_LOADED_ENTRIES = "loaded_entries"
 
