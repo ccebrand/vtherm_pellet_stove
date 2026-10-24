@@ -53,7 +53,7 @@ It is designed exclusively for VTherm `over_switch` thermostats targeting a `cli
 
 ```
 custom_components/vtherm_pellet_stove/
-├── __init__.py          # setup / teardown, factory register/unregister, VTherm reload, sensor platform forward
+├── __init__.py          # setup / teardown, factory, live updates and sensor platform
 ├── manifest.json        # HA integration manifest (dependency: versatile_thermostat)
 ├── config_flow.py       # ConfigFlow (global + per-thermostat) + OptionsFlow
 ├── const.py             # DOMAIN, CONF_* constants, DEFAULT_OPTIONS
@@ -77,10 +77,10 @@ custom_components/vtherm_pellet_stove/
 ### `__init__.py`
 
 - Calls `VThermAPI.register_prop_algorithm(PelletRegulationFactory())` on `async_setup` / `async_setup_entry`.
-- Calls `VThermAPI.unregister_prop_algorithm("pellet_regulation")` when the last plugin entry is removed.
-- Triggers `_reload_pellet_vtherms()` after option changes so new parameters take effect immediately.
+- Calls `VThermAPI.unregister_prop_algorithm("pellet_regulation")` only after the last entry is actually removed, not during unload/reload.
+- Applies Options and Reconfigure to live plugin handlers without reloading or modifying VTherm entries.
 - For the global entry only, forwards the `sensor` platform (`async_forward_entry_setups`) enabling dynamic creation of debug sensors.
-- Skips reload during HA startup to avoid disturbing the VTherm restore sequence.
+- After unload/reload of the global sensor platform, detaches stale references and registers sensors for live handlers again.
 
 ### `factory.py` — `PelletRegulationFactory`
 
@@ -90,16 +90,16 @@ Simple factory: `name = "pellet_regulation"`, `create(thermostat) → PelletRegu
 
 HA lifecycle adapter. Implements `InterfacePropAlgorithmHandler`:
 
-| Method                | Responsibility                                                                                                                               |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init_algorithm`      | Resolve effective options (`_resolve_options`), build `PelletRegulationController`, create `Store`.                                          |
-| `async_added_to_hass` | Load persistent state from `Store`, call `controller.restore_state`.                                                                         |
-| `async_startup`       | Trigger `on_state_changed(True)` → first `control_heating` iteration.                                                                        |
-| `remove`              | Schedule `store.async_save` via `hass.async_create_task`.                                                                                    |
+| Method                | Responsibility                                                                                                                                                                                                                |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_algorithm`      | Resolve effective options (`_resolve_options`), build `PelletRegulationController`, create `Store`.                                                                                                                           |
+| `async_added_to_hass` | Load persistent state from `Store`, call `controller.restore_state`.                                                                                                                                                          |
+| `async_startup`       | Trigger `on_state_changed(True)` → first `control_heating` iteration.                                                                                                                                                         |
+| `remove`              | Schedule `store.async_save` via `hass.async_create_task`.                                                                                                                                                                     |
 | `control_heating`     | Call `controller.calculate`, detect real state transitions (ON↔OFF), update `thermostat.prop_algorithm`, call `scheduler.start_cycle` with `force=True` on any real transition, apply power level, publish HA state, persist. |
-| `on_state_changed`    | Forward to `control_heating` when `changed=True`.                                                                                            |
-| `on_scheduler_ready`  | Store scheduler reference, register cycle callbacks.                                                                                         |
-| `_apply_power_level`  | Call `climate.set_fan_mode / set_preset_mode` on underlying climate entities. Anti-spam: skip if level unchanged.                            |
+| `on_state_changed`    | Forward to `control_heating` when `changed=True`.                                                                                                                                                                             |
+| `on_scheduler_ready`  | Store scheduler reference, register cycle callbacks.                                                                                                                                                                          |
+| `_apply_power_level`  | Call `climate.set_fan_mode / set_preset_mode` on underlying climate entities. Anti-spam: skip if level unchanged.                                                                                                             |
 
 **Option resolution** (`_resolve_options`):
 
@@ -219,7 +219,8 @@ HA boot
   └─ async_setup_entry (plugin)
        ├─ _register_factory → VThermAPI.register_prop_algorithm
        ├─ entry.async_on_unload → _async_update_options listener
-       └─ (if CoreState.running) _reload_pellet_vtherms
+    ├─ forward sensor platform for the global entry
+    └─ apply settings to handlers already alive, if any
 
 VTherm setup (after plugin, dependency declared in manifest.json)
   └─ factory.create(thermostat_runtime)
@@ -255,19 +256,20 @@ VTherm.async_control_heating
 
 ### Flow types
 
-| Flow            | `unique_id`           | Purpose                                           |
-| --------------- | --------------------- | ------------------------------------------------- |
-| Global defaults | `DOMAIN`              | Created automatically on first install.           |
-| Per-thermostat  | `DOMAIN-<vtherm_uid>` | Optional override for a specific thermostat.      |
-| Options (both)  | n/a                   | Edit parameters in place; triggers VTherm reload. |
+| Flow            | `unique_id`           | Purpose                                        |
+| --------------- | --------------------- | ---------------------------------------------- |
+| Global defaults | `DOMAIN`              | Created automatically on first install.        |
+| Per-thermostat  | `DOMAIN-<vtherm_uid>` | Optional override for a specific thermostat.   |
+| Options (both)  | n/a                   | Updates live handlers without a VTherm reload. |
 
-### VTherm reload logic (`_reload_pellet_vtherms`)
+### Scope and application
 
-- Iterates over all `versatile_thermostat` config entries.
-- Filters those with `CONF_PROP_FUNCTION == "pellet_regulation"`.
-- Per-thermostat plugin entry: reloads only the matching VTherm unique_id.
-- Global defaults entry: reloads all matching VTherms **except** those with a per-thermostat override.
-- Only runs when `hass.state == CoreState.running`.
+- A local entry replaces the whole global configuration; missing local keys use defaults. Without a local entry, global settings apply.
+- Options updates the targeted live handler directly (or handlers without local entries for global changes). Reconfigure reloads the Pellet Stove entry, whose setup applies settings to the same live handler.
+- The existing handler retains its state object, timestamps, proxy, lock and scheduler. Diagnostic deadlines use the original timestamps and new durations.
+- Automatic ON is allowed only when every underlying climate exposes a recognized Duepi status that is not burning (`Off`, `Eco idle` or `Cooling down`). Missing, unavailable, unknown, transitional or conflicting states block ON. `Flame On` also prevents a duplicate ON.
+- A breached safety threshold can request OFF even without a target. A VTherm command already in flight remains serialized behind its lock; interruption or material command ordering is not guaranteed.
+- HA's `async_remove_entry` hook unregisters the factory after actual deletion. `async_unload_entry` does not, because HA also uses it during reload.
 
 ---
 
@@ -349,16 +351,16 @@ def _patch_ha_store():
 
 The `PelletRegulationController` emits HA-compatible logs according to this matrix:
 
-| Level     | Condition                                         | Example                                                                                        |
-| --------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `WARNING` | Safety high-temp → forced shutdown                | `Living Room - SAFETY: room temp 27.2°C ≥ 26.0°C → forced shutdown after 45 min of heating`    |
-| `INFO`    | Real ignition (OFF → ON transition)               | `Living Room - Stove ignited (reason=below_on_threshold) after 27 min off [target=20.0 …]`     |
-| `INFO`    | Real shutdown (ON → OFF transition)               | `Living Room - Stove off (reason=above_off_threshold) after 32 min of heating [target=20.0 …]` |
-| `INFO`    | Shutdown delayed by `min_on` guard-rail           | `Living Room - Shutdown delayed (min_on guard): 15/30 min of heating`                          |
-| `INFO`    | Ignition delayed by `min_off+cooldown` guard-rail | `Living Room - Ignition delayed (min_off+cooldown guard): 18/25 min off`                       |
+| Level     | Condition                                         | Example                                                                                               |
+| --------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `WARNING` | Safety high-temp → forced shutdown                | `Living Room - SAFETY: room temp 27.2°C ≥ 26.0°C → forced shutdown after 45 min of heating`           |
+| `INFO`    | Real ignition (OFF → ON transition)               | `Living Room - Stove ignited (reason=below_on_threshold) after 27 min off [target=20.0 …]`            |
+| `INFO`    | Real shutdown (ON → OFF transition)               | `Living Room - Stove off (reason=above_off_threshold) after 32 min of heating [target=20.0 …]`        |
+| `INFO`    | Shutdown delayed by `min_on` guard-rail           | `Living Room - Shutdown delayed (min_on guard): 15/30 min of heating`                                 |
+| `INFO`    | Ignition delayed by `min_off+cooldown` guard-rail | `Living Room - Ignition delayed (min_off+cooldown guard): 18/25 min off`                              |
 | `INFO`    | ON→OFF transition → immediate cycle stop forced   | `Living Room - ON→OFF transition detected (reason=above_off_threshold): forcing immediate cycle stop` |
 | `INFO`    | OFF→ON transition → immediate cycle start forced  | `Living Room - OFF→ON transition detected (reason=below_on_threshold): forcing immediate cycle start` |
-| `DEBUG`   | Every `calculate()` call                          | `PelletController - calculate target=20.0 current=19.3 on_percent=1.0 …`                       |
+| `DEBUG`   | Every `calculate()` call                          | `PelletController - calculate target=20.0 current=19.3 on_percent=1.0 …`                              |
 
 `INFO` and `WARNING` logs are only emitted on a state change or a guard-rail block (anti-spam).
 

@@ -13,7 +13,9 @@ Scénario 10 : Redémarrage HA avec ``is_heating=True`` stocké dans le Store �
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -34,14 +36,17 @@ from custom_components.vtherm_pellet_stove.const import (
     DATA_DEBUG_SENSORS_PREFIX,
     DATA_HANDLERS,
     DATA_SENSOR_ADD_CB,
+    DATA_SENSOR_REGISTERED,
     DEFAULT_OPTIONS,
     DOMAIN,
+    EVENT_SETTINGS_UPDATED,
 )
 from custom_components.vtherm_pellet_stove.handler import (
     PelletRegulationHandler,
     _PropAlgoProxy,
     _resolve_options,
 )
+from custom_components.vtherm_pellet_stove.sensor import PelletDebugSensor
 
 # ---------------------------------------------------------------------------
 # Infrastructure mock partagée
@@ -63,8 +68,18 @@ def _make_hass(entries: list | None = None):
     hass.data = {}
     hass.config_entries.async_entries = MagicMock(return_value=entries or [])
     hass.services.async_call = AsyncMock()
+    physical_states = {}
+    hass.states.get = MagicMock(side_effect=physical_states.get)
 
-    def _create_task(coro, **kwargs):
+    def _set_state(entity_id, state, attributes=None):
+        physical_states[entity_id] = SimpleNamespace(
+            state=state,
+            attributes=attributes or {},
+        )
+
+    hass.states.async_set = MagicMock(side_effect=_set_state)
+
+    def _create_task(coro, **_kwargs):
         """Ferme proprement toute coroutine reçue pour éviter le RuntimeWarning."""
         if asyncio.iscoroutine(coro):
             coro.close()
@@ -95,7 +110,10 @@ def _make_thermostat(
     thermostat.current_temperature = current_temperature
     thermostat.last_temperature_slope = last_temperature_slope
     thermostat.vtherm_hvac_mode = vtherm_hvac_mode
-    thermostat.entry_infos = {"underlying_entity_ids": underlying_list or []}
+    underlying_list = underlying_list or ["climate.pellet_stove"]
+    thermostat.entry_infos = {"underlying_entity_ids": underlying_list}
+    for entity_id in underlying_list:
+        hass.states.async_set(entity_id, "off", {"burner_status": "Off"})
     thermostat.prop_algorithm = None
     thermostat.cycle_min = 5
     thermostat.update_custom_attributes = MagicMock()
@@ -162,6 +180,7 @@ async def test_reset_stops_before_clearing_and_saves():
     handler._last_applied_level_index = 2
     original_state = handler._controller.save_state()
     scheduler.start_cycle.reset_mock()
+    hass.services.async_call.reset_mock()
 
     async def stop(*_args, **_kwargs):
         assert handler._controller.save_state() == original_state
@@ -269,7 +288,9 @@ async def test_reset_waits_for_inflight_control_save():
         else:
             operations.append("save_reset")
 
-    async def stop(*_args, **_kwargs):
+    async def stop(_domain, service, *_args, **_kwargs):
+        if service != "set_hvac_mode":
+            return
         operations.append("stop")
         thermostat.vtherm_hvac_mode = "off"
 
@@ -311,6 +332,101 @@ async def test_control_skipped_during_stop_and_reset_calls_serialized():
     hass.services.async_call.assert_awaited_once()
     assert handler._controller.last_reason == "reset"
     assert not handler._resetting
+
+
+async def test_unknown_physical_state_blocks_automatic_ignition():
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=20.0,
+        current_temperature=18.0,
+        vtherm_hvac_mode="heat",
+    )
+    hass.states.async_set(
+        "climate.pellet_stove", "unknown", {"burner_status": "Unknown state"}
+    )
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    _mock_store(handler)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_not_awaited()
+    assert handler._controller.is_heating is False
+    assert handler._controller.last_reason == "physical_state_not_confirmed_off"
+
+
+async def test_known_flame_does_not_send_duplicate_ignition():
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=20.0,
+        current_temperature=18.0,
+        vtherm_hvac_mode="heat",
+    )
+    hass.states.async_set(
+        "climate.pellet_stove", "heat", {"burner_status": "Flame On"}
+    )
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    _mock_store(handler)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_not_awaited()
+    assert handler._controller.is_heating is False
+
+
+async def test_conflicting_physical_status_blocks_automatic_ignition():
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=20.0,
+        current_temperature=18.0,
+        vtherm_hvac_mode="heat",
+    )
+    hass.states.async_set(
+        "climate.pellet_stove",
+        "heat",
+        {"burner_status": "Off", "hvac_action": "heating"},
+    )
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    _mock_store(handler)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_not_awaited()
+    assert handler._controller.is_heating is False
+
+
+async def test_safety_stop_without_target_requests_off():
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=None,
+        current_temperature=27.0,
+        vtherm_hvac_mode="heat",
+    )
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    handler._controller.state.is_heating = True
+    _mock_store(handler)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_awaited_once_with("heat", 0.0, True)
+    scheduler.cancel_cycle.assert_awaited_once()
+    assert handler._controller.is_heating is False
+    assert handler._controller.last_reason == "safety"
 
 
 async def test_unload_during_stop_prevents_reset_of_removed_handler():
@@ -391,6 +507,302 @@ class TestScenario7OptionsUpdate:
         hass = _make_hass(entries=[global_entry, per_entry])
         opts = _resolve_options(hass, "other_vt_uid")
         assert opts[CONF_HYSTERESIS_ON] == pytest.approx(0.8)  # global only
+
+    def test_partial_per_thermostat_entry_uses_defaults_not_global(self):
+        """Une entrée locale partielle ne complète jamais ses clés depuis le global."""
+        global_entry = _make_entry(
+            data={CONF_HYSTERESIS_ON: 0.8, CONF_MIN_ON_DURATION_MIN: 12},
+            unique_id=DOMAIN,
+        )
+        per_entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={CONF_HYSTERESIS_ON: 1.2},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[global_entry, per_entry])
+
+        opts = _resolve_options(hass, "my_vt_uid")
+
+        assert opts[CONF_HYSTERESIS_ON] == pytest.approx(1.2)
+        assert opts[CONF_MIN_ON_DURATION_MIN] == DEFAULT_OPTIONS[CONF_MIN_ON_DURATION_MIN]
+
+    async def test_live_options_update_preserves_controller_state_and_scheduler(self):
+        """Updating settings retains state, timestamps, and the live scheduler."""
+        now = _now()
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={CONF_MIN_ON_DURATION_MIN: 42},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        thermostat = _make_thermostat(hass, unique_id="my_vt_uid")
+        handler = PelletRegulationHandler(thermostat)
+        handler.init_algorithm()
+        handler._controller.state.is_heating = True
+        handler._controller.state.last_on_at = now - timedelta(minutes=7)
+        handler._controller.state.last_off_at = now - timedelta(hours=2)
+        handler._debug_sensor = PelletDebugSensor(thermostat)
+        scheduler = _make_scheduler()
+        handler.on_scheduler_ready(scheduler)
+        state = handler._controller.state
+
+        assert await handler.async_update_options()
+
+        assert handler._controller.state is state
+        assert state.last_on_at == now - timedelta(minutes=7)
+        assert state.last_off_at == now - timedelta(hours=2)
+        assert handler._controller._guard.min_on_duration_min == 42
+        assert handler._scheduler is scheduler
+        assert handler._debug_sensor.extra_state_attributes[
+            "next_action_allowed_at"
+        ] == (now - timedelta(minutes=7) + timedelta(minutes=42)).isoformat()
+        scheduler.start_cycle.assert_not_awaited()
+
+    async def test_live_options_update_fires_settings_event_only_for_changes(
+        self, caplog
+    ):
+        """Publish changed effective options once with the VTherm identity."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        hass.states.async_set("climate.test_vtherm", "heat", {"temperature": 21.0})
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        hass.bus.async_fire.assert_not_called()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with caplog.at_level(logging.INFO):
+            assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+        info_records = [
+            record for record in caplog.records if record.levelno == logging.INFO
+        ]
+        assert len(info_records) == 1
+        assert "Test VTherm" in info_records[0].message
+        assert EVENT_SETTINGS_UPDATED in info_records[0].message
+        assert "'min_on_duration_min': 42" in info_records[0].message
+        event_type, event_data = hass.bus.async_fire.call_args.args
+        assert event_type == EVENT_SETTINGS_UPDATED
+        assert event_data == {
+            "entity_id": "climate.test_vtherm",
+            "name": "Test VTherm",
+            "state": "heat",
+            "state_attributes": {"temperature": 21.0},
+            "configuration": {
+                **DEFAULT_OPTIONS,
+                CONF_MIN_ON_DURATION_MIN: 42,
+            },
+        }
+
+        with caplog.at_level(logging.INFO):
+            assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+        assert (
+            len([record for record in caplog.records if record.levelno == logging.INFO])
+            == 1
+        )
+
+    async def test_live_options_update_does_not_fire_event_on_failure(self):
+        """Do not publish an update when applying the controller config fails."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with patch.object(
+            handler._controller,
+            "update_configuration",
+            side_effect=RuntimeError("configuration failed"),
+        ):
+            with pytest.raises(RuntimeError, match="configuration failed"):
+                await handler.async_update_options()
+
+        hass.bus.async_fire.assert_not_called()
+        assert (
+            handler._opts[CONF_MIN_ON_DURATION_MIN]
+            == DEFAULT_OPTIONS[CONF_MIN_ON_DURATION_MIN]
+        )
+        assert (
+            handler._controller._guard.min_on_duration_min
+            == DEFAULT_OPTIONS[CONF_MIN_ON_DURATION_MIN]
+        )
+        assert await handler.async_update_options()
+        hass.bus.async_fire.assert_called_once()
+
+    async def test_live_options_update_keeps_applied_options_when_bus_fails(self):
+        """A bus error is logged without reverting an applied configuration."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with (
+            patch.object(
+                hass.bus,
+                "async_fire",
+                side_effect=RuntimeError("bus unavailable"),
+            ) as fire_event,
+            patch(
+                "custom_components.vtherm_pellet_stove.handler._LOGGER.exception"
+            ) as log_exception,
+        ):
+            assert await handler.async_update_options()
+            fire_event.assert_called_once()
+            log_exception.assert_called_once()
+
+            assert handler._opts[CONF_MIN_ON_DURATION_MIN] == 42
+            assert handler._controller._guard.min_on_duration_min == 42
+            assert await handler.async_update_options()
+            fire_event.assert_called_once()
+
+    async def test_live_options_update_notifies_even_when_control_fails(self, caplog):
+        """A control error propagates after options are applied and notified."""
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={},
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="my_vt_uid"))
+        handler.init_algorithm()
+        handler.on_scheduler_ready(_make_scheduler())
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(
+                handler,
+                "_async_control_heating",
+                side_effect=RuntimeError("control failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="control failed"):
+                await handler.async_update_options()
+
+            assert handler._opts[CONF_MIN_ON_DURATION_MIN] == 42
+            assert handler._controller._guard.min_on_duration_min == 42
+            hass.bus.async_fire.assert_called_once()
+            assert not [
+                record for record in caplog.records if record.levelno == logging.INFO
+            ]
+
+            with pytest.raises(RuntimeError, match="control failed"):
+                await handler.async_update_options()
+            hass.bus.async_fire.assert_called_once()
+
+    async def test_duration_only_options_update_does_not_reapply_power_level(self):
+        """Changing a guard duration must not resend an unchanged power level."""
+        entry = _make_entry(
+            data={
+                CONF_MIN_ON_DURATION_MIN: 30,
+                CONF_POWER_CONTROL_ENABLED: True,
+                CONF_POWER_CONTROL_ATTRIBUTE: "fan_mode",
+                CONF_POWER_LEVELS: ["1", "2", "3", "4", "5"],
+            },
+            unique_id=DOMAIN,
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass))
+        handler.init_algorithm()
+        handler._controller.state.is_heating = True
+        handler._controller.state.current_level_index = 2
+
+        await handler._apply_power_level()
+        hass.services.async_call.reset_mock()
+        entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+        assert await handler.async_update_options()
+        await handler._apply_power_level()
+
+        hass.services.async_call.assert_not_awaited()
+
+    async def test_changed_effective_power_value_is_reapplied(self):
+        """A new mapped value at the current index is sent to the stove."""
+        entry = _make_entry(
+            data={
+                CONF_POWER_CONTROL_ENABLED: True,
+                CONF_POWER_CONTROL_ATTRIBUTE: "fan_mode",
+                CONF_POWER_LEVELS: ["1", "2", "3", "4", "5"],
+            },
+            unique_id=DOMAIN,
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(_make_thermostat(hass))
+        handler.init_algorithm()
+        handler._controller.state.is_heating = True
+        handler._controller.state.current_level_index = 2
+
+        await handler._apply_power_level()
+        hass.services.async_call.reset_mock()
+        entry.options = {CONF_POWER_LEVELS: ["1", "2", "high", "4", "5"]}
+
+        assert await handler.async_update_options()
+        await handler._apply_power_level()
+
+        hass.services.async_call.assert_awaited_once_with(
+            "climate",
+            "set_fan_mode",
+            {"entity_id": "climate.pellet_stove", "fan_mode": "high"},
+            blocking=False,
+        )
+
+    async def test_sensor_is_recreated_after_platform_unload(self):
+        """A platform reload registers a fresh sensor for the live handler."""
+        hass = _make_hass()
+        thermostat = _make_thermostat(hass, unique_id="my_vt_uid")
+        handler = PelletRegulationHandler(thermostat)
+        handler.init_algorithm()
+        hass.data.setdefault(DOMAIN, {})[DATA_SENSOR_ADD_CB] = MagicMock()
+        await handler.async_added_to_hass()
+        first_sensor = handler._debug_sensor
+        callback = hass.data[DOMAIN][DATA_SENSOR_ADD_CB]
+        assert callback.call_count == 1
+
+        handler.detach_debug_sensor()
+        handler.attach_debug_sensor()
+
+        assert handler._debug_sensor is not first_sensor
+        assert callback.call_count == 2
+
+    async def test_live_options_update_recalculates_off_deadline(self):
+        """New off guards use the historic timestamp, not the edit time."""
+        now = _now()
+        last_off_at = now - timedelta(minutes=12)
+        entry = _make_entry(
+            data={CONF_TARGET_VTHERM: "my_vt_uid"},
+            options={
+                CONF_MIN_OFF_DURATION_MIN: 33,
+                CONF_COOLDOWN_DURATION_MIN: 8,
+            },
+            unique_id=f"{DOMAIN}-my_vt_uid",
+        )
+        hass = _make_hass(entries=[entry])
+        handler = PelletRegulationHandler(
+            _make_thermostat(hass, unique_id="my_vt_uid")
+        )
+        handler.init_algorithm()
+        handler._controller.state.last_off_at = last_off_at
+        handler._debug_sensor = PelletDebugSensor(handler._thermostat)
+
+        assert await handler.async_update_options()
+
+        assert handler._controller.state.last_off_at == last_off_at
+        assert handler._debug_sensor.extra_state_attributes[
+            "next_action_allowed_at"
+        ] == (last_off_at + timedelta(minutes=41)).isoformat()
 
     # --- init_algorithm + reload --------------------------------------------
 
@@ -619,6 +1031,7 @@ class TestScenario12DebugSensorReuse:
         # Simule un capteur déjà enregistré par le premier handler.
         fake_existing_sensor = MagicMock()
         hass.data.setdefault(DOMAIN, {})[sensor_key] = fake_existing_sensor
+        hass.data[DOMAIN][DATA_SENSOR_REGISTERED] = {"vt_uid"}
 
         cb = MagicMock()
         hass.data[DOMAIN][DATA_SENSOR_ADD_CB] = cb
@@ -634,6 +1047,23 @@ class TestScenario12DebugSensorReuse:
         assert handler._debug_sensor is fake_existing_sensor
         # async_add_entities NE doit PAS être rappelé (pas de ré-enregistrement).
         cb.assert_not_called()
+
+    async def test_cached_unregistered_sensor_is_added_once(self):
+        """A cached sensor without platform registration is still added."""
+        hass = _make_hass_with_data()
+        sensor_key = DATA_DEBUG_SENSORS_PREFIX + "vt_uid"
+        cached_sensor = MagicMock()
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        domain_data[sensor_key] = cached_sensor
+        callback = MagicMock()
+        domain_data[DATA_SENSOR_ADD_CB] = callback
+
+        handler = PelletRegulationHandler(_make_thermostat(hass, unique_id="vt_uid"))
+        handler.init_algorithm()
+        await handler.async_added_to_hass()
+
+        callback.assert_called_once_with([cached_sensor], update_before_add=True)
+        assert domain_data[DATA_SENSOR_REGISTERED] == {"vt_uid"}
 
     async def test_debug_sensor_updated_with_new_options_after_reload(self):
         """Après reload, update_from_controller est appelé avec le nouveau contrôleur."""
@@ -661,8 +1091,6 @@ class TestScenario12DebugSensorReuse:
         real_sensor = handler1._debug_sensor  # sensor réellement créé
 
         # Simule update_from_controller (normalement appelé par control_heating)
-        from datetime import datetime, timezone
-
         now = datetime(2026, 1, 15, 20, 0, tzinfo=timezone.utc)
         real_sensor.update_from_controller(handler1._controller, now)
 

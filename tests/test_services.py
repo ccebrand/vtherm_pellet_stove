@@ -1,3 +1,5 @@
+# pylint: disable=protected-access
+
 """Home Assistant service registration, validation and lifecycle tests."""
 
 import json
@@ -15,10 +17,15 @@ from homeassistant.exceptions import ServiceValidationError, Unauthorized, Unkno
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.vtherm_pellet_stove.const import (
+    CONF_MIN_ON_DURATION_MIN,
+    CONF_TARGET_VTHERM,
     DATA_HANDLERS,
+    DATA_LOADED_ENTRIES,
     DOMAIN,
     SERVICE_RESET,
 )
+from custom_components.vtherm_pellet_stove.handler import PelletRegulationHandler
+from custom_components.vtherm_pellet_stove.sensor import PelletDebugSensor
 
 
 @pytest.fixture(name="integration")
@@ -32,7 +39,6 @@ def integration_module(monkeypatch):
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "_register_factory", MagicMock())
-    monkeypatch.setattr(module, "_reload_pellet_vtherms", AsyncMock())
     return module
 
 
@@ -112,7 +118,6 @@ async def test_service_lifecycle_ignores_handler_and_sensor_keys(hass, integrati
     monkeypatch.setattr(integration, "_register_factory", MagicMock())
     unregister = MagicMock()
     monkeypatch.setattr(integration, "_unregister_factory", unregister)
-    monkeypatch.setattr(integration, "_reload_pellet_vtherms", AsyncMock())
     entries = [MagicMock(entry_id=key, unique_id=key) for key in ("first", "second")]
     for entry in entries:
         await integration.async_setup_entry(hass, entry)
@@ -124,9 +129,108 @@ async def test_service_lifecycle_ignores_handler_and_sensor_keys(hass, integrati
     unregister.assert_not_called()
     assert await integration.async_unload_entry(hass, entries[1])
     assert not hass.services.has_service(DOMAIN, SERVICE_RESET)
+    unregister.assert_not_called()
+    await integration.async_remove_entry(hass, entries[1])
     unregister.assert_called_once()
     await integration.async_setup_entry(hass, entries[0])
     assert hass.services.has_service(DOMAIN, SERVICE_RESET)
+
+
+async def test_local_options_reload_does_not_reload_vtherm(hass, integration, monkeypatch):
+    """Local Options updates a live handler without reloading its VTherm."""
+    global_entry = MagicMock(
+        entry_id="global-plugin",
+        unique_id=DOMAIN,
+        data={},
+        options={CONF_MIN_ON_DURATION_MIN: 30},
+    )
+    entry = MagicMock(
+        entry_id="local-plugin",
+        unique_id=f"{DOMAIN}-vt_uid",
+        data={CONF_TARGET_VTHERM: "vt_uid"},
+        options={CONF_MIN_ON_DURATION_MIN: 10},
+    )
+    hass.config_entries.async_entries = MagicMock(return_value=[global_entry, entry])
+    thermostat = MagicMock(
+        hass=hass,
+        unique_id="vt_uid",
+        name="Test VTherm",
+    )
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    sensor = PelletDebugSensor(thermostat)
+    handler._debug_sensor = sensor
+    sensor.update_from_controller(handler._controller)
+    hass.data.setdefault(DOMAIN, {})[DATA_HANDLERS] = {"vt_uid": handler}
+    hass.data[DOMAIN][DATA_LOADED_ENTRIES] = {"global-plugin"}
+
+    reload_entry = AsyncMock()
+    monkeypatch.setattr(hass.config_entries, "async_reload", reload_entry)
+    entry.options = {CONF_MIN_ON_DURATION_MIN: 42}
+
+    await integration._async_update_options(hass, entry)
+
+    reload_entry.assert_not_awaited()
+    assert sensor.native_value != "unknown"
+    assert sensor.extra_state_attributes
+    assert {
+        "handler": handler._controller._guard.min_on_duration_min,
+        "diagnostic": sensor.extra_state_attributes["min_on_duration_min"],
+    } == {"handler": 42, "diagnostic": 42}
+
+
+async def test_local_options_reload_without_global_keeps_vtherm_running(
+    hass, integration, monkeypatch
+):
+    """Options reload must not reload VTherm when the local entry is the only one."""
+    entry = MagicMock(
+        entry_id="local-plugin",
+        unique_id=f"{DOMAIN}-vt_uid",
+        data={CONF_TARGET_VTHERM: "vt_uid"},
+        options={},
+    )
+    unregister = MagicMock()
+    monkeypatch.setattr(integration, "_unregister_factory", unregister)
+    reload_entry = AsyncMock()
+    monkeypatch.setattr(hass.config_entries, "async_reload", reload_entry)
+    handler = SimpleNamespace(async_update_options=AsyncMock(return_value=True))
+    hass.data.setdefault(DOMAIN, {})[DATA_HANDLERS] = {"vt_uid": handler}
+    await integration.async_setup_entry(hass, entry)
+
+    await integration._async_update_options(hass, entry)
+
+    reload_entry.assert_not_awaited()
+    assert handler.async_update_options.await_count == 2
+    unregister.assert_not_called()
+
+
+async def test_global_options_skip_handlers_with_local_entries(hass, integration):
+    global_entry = MagicMock(
+        entry_id="global",
+        unique_id=DOMAIN,
+        data={},
+        options={CONF_MIN_ON_DURATION_MIN: 30},
+    )
+    local_entry = MagicMock(
+        entry_id="local",
+        unique_id=f"{DOMAIN}-local_uid",
+        data={CONF_TARGET_VTHERM: "local_uid"},
+        options={CONF_MIN_ON_DURATION_MIN: 10},
+    )
+    hass.config_entries.async_entries = MagicMock(
+        return_value=[global_entry, local_entry]
+    )
+    global_handler = SimpleNamespace(async_update_options=AsyncMock(return_value=True))
+    local_handler = SimpleNamespace(async_update_options=AsyncMock(return_value=True))
+    hass.data.setdefault(DOMAIN, {})[DATA_HANDLERS] = {
+        "global_uid": global_handler,
+        "local_uid": local_handler,
+    }
+
+    await integration._async_update_options(hass, global_entry)
+
+    global_handler.async_update_options.assert_awaited_once()
+    local_handler.async_update_options.assert_not_awaited()
 
 
 async def test_failed_global_setup_does_not_register_service(hass, integration, monkeypatch):
