@@ -198,11 +198,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.unique_id == DOMAIN:
         await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
 
-    # During initial HA startup, VTherm restores its own entries independently.
-    # Reloading them here would be redundant and could disturb state restore.
-    if hass.state == CoreState.running:
-        await _reload_pellet_vtherms(hass)
-
     data[entry.entry_id] = entry.entry_id
     data.setdefault(DATA_LOADED_ENTRIES, set()).add(entry.entry_id)
     _register_services(hass)

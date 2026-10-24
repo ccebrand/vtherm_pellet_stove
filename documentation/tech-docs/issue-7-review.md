@@ -56,10 +56,18 @@ Compatibilite : conserver les entrees existantes, les cles de stockage, les iden
 - A verifier : existence de doublons non lies ; la page de l'issue ne signale aucune relation ou PR, ce qui ne prouve pas l'absence de travail parallele.
 
 ## Suite proposee et criteres de passage au developpement
+## Resultat de verification technique (2026-10-24)
+
+Le parcours Options local a ete simule avec le cycle HA `unload -> setup`, une entree globale deja chargee, un handler reel et son capteur de diagnostic. Apres le changement de `min_on_duration_min` de 10 a 42, aucun reload VTherm n'a lieu, mais le handler et le diagnostic gardent la valeur 10 : l'application des options sur le runtime est donc reproduite comme defaillante. Le capteur conserve un etat et des attributs non vides dans ce test ; le symptome rapporte de diagnostic vide et la panne effective de pilotage ne sont pas reproduits. Sans entree globale, le dernier unload appelle encore `_reload_pellet_vtherms`, en contradiction avec l'exigence de ne jamais recharger VTherm.
+
+Le contrat `vtherm_api` 0.7.0 installe expose le cycle de vie du handler, pas d'operation publique de mise a jour, de resultat de commande ou de confirmation physique. Le handler protege son controle par `_control_lock` et attend `scheduler.start_cycle`; le scheduler attend ensuite la commande underlying. `cancel_cycle` retire les callbacks/timers mais ne conserve ni n'annule la tache de commande en cours. De plus, `control_heating` retourne avant le calcul de securite si la consigne est absente. Une mise a jour locale ne peut donc pas garantir l'arret prioritaire exige en vol ni le traitement d'un etat physique incertain avec les contrats verifies. Aucun poele reel n'a ete commande.
+
+Les deux scenarios correspondants sont conserves en XFAIL strict dans `tests/test_services.py`. Le developpement est bloque a ce jalon : aucune correction partielle n'est presentee comme satisfaisant AC-001..010 ; il faut un contrat permettant l'observation/coordination des commandes ou une decision de perimetre compatible avec la surete.
+
 
 1. Faire valider ce rapport et les questions de comportement par l'utilisateur.
 2. Rediger et faire converger specification fonctionnelle et conception technique ; definir les invariants du cycle, le moment d'application des commandes et le traitement de la plateforme sensor.
 3. Faire valider ces resultats avant tout developpement. La precision recue sur le rechargement doit etre integree aux specifications et a la conception ; les autres arbitrages bloquants doivent etre leves avant ce jalon.
 4. Pour la mise en oeuvre autorisee : exiger des tests de reconfiguration globale/par thermostat, Options/Reconfigurer, etat chauffe/arret, preservation des horodatages et du cycle, diagnostic enregistre et actualise, absence de commandes inattendues, restauration et ordre de sauvegarde. Mettre a jour la documentation d'utilisation et verifier les tests pertinents.
 
-**Statut : rapport valide par l'utilisateur le 2026-10-23 pour la specification et la conception ; developpement non autorise a ce stade.**
+**Statut : rapport valide le 2026-10-23 ; specifications et conception validees et developpement autorise par l'utilisateur le 2026-10-24 dans ce perimetre, sous reserve des verifications de faisabilite technique.**
