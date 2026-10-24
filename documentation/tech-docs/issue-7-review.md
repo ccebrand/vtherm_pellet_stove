@@ -56,6 +56,14 @@ Compatibilite : conserver les entrees existantes, les cles de stockage, les iden
 - A verifier : existence de doublons non lies ; la page de l'issue ne signale aucune relation ou PR, ce qui ne prouve pas l'absence de travail parallele.
 
 ## Suite proposee et criteres de passage au developpement
+
+1. Faire valider ce rapport et les questions de comportement par l'utilisateur.
+2. Rediger et faire converger specification fonctionnelle et conception technique ; definir les invariants du cycle, le moment d'application des commandes et le traitement de la plateforme sensor.
+3. Faire valider ces resultats avant tout developpement. La precision recue sur le rechargement doit etre integree aux specifications et a la conception ; les autres arbitrages bloquants doivent etre leves avant ce jalon.
+4. Pour la mise en oeuvre autorisee : exiger des tests de reconfiguration globale/par thermostat, Options/Reconfigurer, etat chauffe/arret, preservation des horodatages et du cycle, diagnostic enregistre et actualise, absence de commandes inattendues, restauration et ordre de sauvegarde. Mettre a jour la documentation d'utilisation et verifier les tests pertinents.
+
+**Statut : rapport valide le 2026-10-23 ; specifications et conception validees et developpement autorise par l'utilisateur le 2026-10-24 dans ce perimetre, sous reserve des verifications de faisabilite technique.**
+
 ## Resultat de verification technique (2026-10-24)
 
 Le parcours Options local a ete simule avec le cycle HA `unload -> setup`, une entree globale deja chargee, un handler reel et son capteur de diagnostic. Apres le changement de `min_on_duration_min` de 10 a 42, aucun reload VTherm n'a lieu, mais le handler et le diagnostic gardent la valeur 10 : l'application des options sur le runtime est donc reproduite comme defaillante. Le capteur conserve un etat et des attributs non vides dans ce test ; le symptome rapporte de diagnostic vide et la panne effective de pilotage ne sont pas reproduits. Sans entree globale, le dernier unload appelle encore `_reload_pellet_vtherms`, en contradiction avec l'exigence de ne jamais recharger VTherm.
@@ -64,10 +72,24 @@ Le contrat `vtherm_api` 0.7.0 installe expose le cycle de vie du handler, pas d'
 
 Les deux scenarios correspondants sont conserves en XFAIL strict dans `tests/test_services.py`. Le developpement est bloque a ce jalon : aucune correction partielle n'est presentee comme satisfaisant AC-001..010 ; il faut un contrat permettant l'observation/coordination des commandes ou une decision de perimetre compatible avec la surete.
 
+## Complément de faisabilité : observation Duepi (2026-10-24)
 
-1. Faire valider ce rapport et les questions de comportement par l'utilisateur.
-2. Rediger et faire converger specification fonctionnelle et conception technique ; definir les invariants du cycle, le moment d'application des commandes et le traitement de la plateforme sensor.
-3. Faire valider ces resultats avant tout developpement. La precision recue sur le rechargement doit etre integree aux specifications et a la conception ; les autres arbitrages bloquants doivent etre leves avant ce jalon.
-4. Pour la mise en oeuvre autorisee : exiger des tests de reconfiguration globale/par thermostat, Options/Reconfigurer, etat chauffe/arret, preservation des horodatages et du cycle, diagnostic enregistre et actualise, absence de commandes inattendues, restauration et ordre de sauvegarde. Mettre a jour la documentation d'utilisation et verifier les tests pertinents.
+Précision utilisateur : l'entité `climate` Duepi_evo est l'underlying du VTherm et Pellet Stove peut lire son état HA via `underlying_entity_ids`. Ce fait apporte une source d'observation du brûleur, mais pas un reçu corrélé à une commande.
 
-**Statut : rapport valide le 2026-10-23 ; specifications et conception validees et developpement autorise par l'utilisateur le 2026-10-24 dans ce perimetre, sous reserve des verifications de faisabilite technique.**
+Sémantique vérifiée dans `duepi_evo/client.py` et `climate.py` : `Off` donne le mode `off` et `heating=False`; `Cooling down` donne `heat`, `heating=False` et l'action HA `idle`; `Eco idle` donne `heat`, `heating=True` mais l'action HA `idle`; `Flame On` donne `heat` et l'action `heating`. `Ignition starting` et `Cleaning` sont des phases de transition. `Unknown state` ne constitue pas une confirmation de chauffe. Quand `coordinator.data is None`, les propriétés climate renvoient aussi `HVACMode.OFF`/`HVACAction.OFF` et des attributs nuls : ce fallback ne prouve pas que le poêle est éteint. Une observation absente, indisponible, inconnue ou incohérente doit rester « inconnue »; `heat` seul n'est pas une preuve de flamme, et `idle` n'est pas `off`.
+
+Après un ACK Duepi, `async_set_hvac_mode` appelle `coordinator.async_request_refresh()`. Home Assistant termine le refresh, notifie les listeners du coordinator et l'entité Duepi écrit son état HA avant le retour de cette attente. Cela rend le dernier snapshot réussi observable après un appel direct bloquant; ce snapshot reste une lecture du brûleur, pas un reçu de réussite de la commande. Le handler Duepi intercepte les erreurs client et retourne sans refresh, et un échec de refresh rend l'entité indisponible : le retour normal d'un service ne suffit donc pas à établir l'état.
+
+Blocage restant vérifié dans VTherm : `UnderlyingClimate.hass_services_async_call` appelle `hass.services.async_call` sans `blocking=True`. Le scheduler peut donc rendre la main avant que le handler Duepi termine l'ACK et son refresh. Pellet Stove n'a ni identifiant de commande, ni tâche de commande suivie, ni événement permettant de corréler le prochain snapshot à cette commande. Le dernier état HA peut décrire l'état physique observé, mais ne démontre ni la fin d'une commande en vol, ni l'ordre effectif d'un OFF prioritaire suivi d'une ancienne commande ON. Sans modifier le contrat VTherm/Duepi (explicitement hors périmètre), FR-006/AC-005 et BR-004/AC-009 ne peuvent pas être garanties sans risque; aucun test n'envoie de commande à un poêle réel.
+
+Correction sûre livrée à ce jalon : `_resolve_options` choisit désormais l'entrée locale seule, ou l'entrée globale en l'absence d'entrée locale, puis complète avec les défauts. Le test de régression vérifie qu'une clé locale absente ne récupère pas la valeur globale. L'application des options aux handlers vivants, le contrôle à chaud, la reprise du scheduler et la publication après reload restent bloqués par le contrat décrit ci-dessus; les deux tests XFAIL stricts de reconfiguration restent des preuves rouges, et non des critères satisfaits.
+
+## Mise à jour d'implémentation (2026-10-24)
+
+Le périmètre local autorisé a été implémenté dans Pellet Stove. Options met à jour les handlers vivants via l'API du plugin; Reconfigurer applique les nouvelles valeurs au setup de l'entrée Pellet Stove. Le contrôleur conserve le même objet d'état et ses horodatages, ainsi que le handler, son proxy, son verrou et son scheduler. Les échéances du diagnostic sont recalculées à partir des anciens horodatages. Une entrée locale reste complète et n'hérite jamais des valeurs globales.
+
+Le cycle de vie ne recharge plus VTherm : un unload conserve la factory; le hook public HA `async_remove_entry` ne la retire qu'après suppression effective. Un unload/reload de la plateforme sensor globale détache puis recrée les objets diagnostiques des handlers actifs. En l'absence d'une observation Duepi reconnue comme non-allumée, aucune transition automatique ON n'est permise; `Flame On` évite aussi un ON doublonné. Un seuil de sécurité dépassé peut demander OFF même sans consigne.
+
+Les reproductions Options local avec et sans entrée globale, auparavant strictement XFAIL, sont désormais des tests verts. Des tests fakes couvrent état physique connu/inconnu, absence de commande ON en état inconnu, absence de double ON, arrêt sécurité sans cible, conservation des timestamps, échéances min-on/min-off recalculées, routing global/local et remplacement du capteur après unload simulé. Ils ne prouvent pas le comportement du poêle réel ni un ordre matériel.
+
+Limite bloquante maintenue : le verrou de contrôle sérialise l'application avec une commande VTherm déjà attendue, et l'API VTherm/Duepi ne fournit ni tâche/résultat corrélé ni garantie d'interruption ou d'ordre des appels underlyings. La priorité OFF pendant une commande en vol n'est donc pas garantie; AC-005/009 ne sont pas déclarés satisfaits. Le minimum d'état physiquement confirmé, l'échec de Store/reprise, le contrôle HA bout en bout des quatre parcours et le symptôme initial de diagnostic vide restent à vérifier. Aucun poêle réel n'a été commandé; aucun fichier Versatile Thermostat, Duepi-evo ou heating_simulator n'a été modifié.

@@ -32,6 +32,7 @@ from .const import (
     DATA_DEBUG_SENSORS_PREFIX,
     DATA_HANDLERS,
     DATA_SENSOR_ADD_CB,
+    DATA_SENSOR_REGISTERED,
     DEFAULT_OPTIONS,
     DOMAIN,
     STORAGE_KEY,
@@ -79,7 +80,7 @@ class _PropAlgoProxy:
     def calculated_on_percent(self) -> float:
         return self._controller.calculated_on_percent
 
-    def calculate(self, *args: Any, **kwargs: Any) -> float:
+    def calculate(self, *_args: Any, **_kwargs: Any) -> float:
         """No-op: actual calculation is managed by PelletRegulationHandler.control_heating()."""
         return self._controller.on_percent or 0.0
 
@@ -87,7 +88,7 @@ class _PropAlgoProxy:
 def _resolve_options(hass: Any, vtherm_uid: str | None) -> dict[str, Any]:
     """Return the effective options for a given VTherm unique_id.
 
-    Priority: per-thermostat plugin entry > global defaults entry > DEFAULT_OPTIONS.
+    A per-thermostat entry is complete and never inherits global values.
     """
     _LOGGER.debug("%s - _resolve_options: start (vtherm_uid=%s)", DOMAIN, vtherm_uid)
     opts: dict[str, Any] = dict(DEFAULT_OPTIONS)
@@ -102,17 +103,15 @@ def _resolve_options(hass: Any, vtherm_uid: str | None) -> dict[str, Any]:
         elif target == vtherm_uid:
             per_entry = entry
 
-    if global_entry is not None:
-        _LOGGER.debug("%s - _resolve_options: applying global options", DOMAIN)
-        opts.update(dict(global_entry.options or global_entry.data))
-
-    if per_entry is not None:
+    selected_entry = per_entry or global_entry
+    if selected_entry is not None:
         _LOGGER.debug(
-            "%s - _resolve_options: applying per-thermostat options (target=%s)",
+            "%s - _resolve_options: applying %s options (target=%s)",
             DOMAIN,
+            "per-thermostat" if per_entry is not None else "global",
             vtherm_uid,
         )
-        opts.update(dict(per_entry.options or per_entry.data))
+        opts.update(dict(selected_entry.options or selected_entry.data))
 
     _LOGGER.debug("%s - _resolve_options: completed", DOMAIN)
     return opts
@@ -191,6 +190,59 @@ class PelletRegulationHandler:
             self._opts[CONF_SAFETY_ROOM_TEMP],
         )
 
+    async def async_update_options(self) -> bool:
+        """Apply the current effective options while retaining the live runtime."""
+        async with self._control_lock:
+            if self._removed or self._controller is None:
+                return False
+
+            options = _resolve_options(
+                self._thermostat.hass, self._thermostat.unique_id
+            )
+            previous_power_enabled = bool(
+                self._opts.get(CONF_POWER_CONTROL_ENABLED)
+            )
+            previous_power_attribute = self._opts.get(
+                CONF_POWER_CONTROL_ATTRIBUTE, "fan_mode"
+            )
+            previous_level_index = self._controller.current_level_index
+            previous_level_value = self._controller.current_level_value
+            self._opts = options
+            self._controller.update_configuration(
+                hysteresis_on=float(options[CONF_HYSTERESIS_ON]),
+                hysteresis_off=float(options[CONF_HYSTERESIS_OFF]),
+                min_on_percent=float(options[CONF_MIN_ON_PERCENT]),
+                max_on_percent=float(options[CONF_MAX_ON_PERCENT]),
+                min_on_duration_min=int(options[CONF_MIN_ON_DURATION_MIN]),
+                min_off_duration_min=int(options[CONF_MIN_OFF_DURATION_MIN]),
+                cooldown_duration_min=int(options[CONF_COOLDOWN_DURATION_MIN]),
+                safety_room_temp=float(options[CONF_SAFETY_ROOM_TEMP]),
+                power_control_enabled=bool(options[CONF_POWER_CONTROL_ENABLED]),
+                power_levels=list(options.get(CONF_POWER_LEVELS) or []) or None,
+                power_default_level_index=int(
+                    options[CONF_POWER_DEFAULT_LEVEL_INDEX]
+                ),
+                power_boost_enabled=bool(options[CONF_POWER_BOOST_ENABLED]),
+                power_boost_duration_min=int(
+                    options[CONF_POWER_BOOST_DURATION_MIN]
+                ),
+            )
+            power_configuration_changed = (
+                previous_power_enabled
+                != bool(options[CONF_POWER_CONTROL_ENABLED])
+                or previous_power_attribute
+                != options.get(CONF_POWER_CONTROL_ATTRIBUTE, "fan_mode")
+                or previous_level_index != self._controller.current_level_index
+                or previous_level_value != self._controller.current_level_value
+            )
+            if power_configuration_changed:
+                self._last_applied_level_index = None
+            if self._debug_sensor is not None:
+                self._debug_sensor.update_from_controller(self._controller)
+            if self._scheduler is not None:
+                await self._async_control_heating()
+            return True
+
     async def async_added_to_hass(self) -> None:
         """Restore persistent state when the thermostat entity is added to HA."""
         _LOGGER.debug("%s - async_added_to_hass: start", self._thermostat.name)
@@ -221,45 +273,50 @@ class PelletRegulationHandler:
         else:
             _LOGGER.debug("%s - async_added_to_hass: no persisted data", self._thermostat.name)
 
-        # Attach to (or create) the persistent debug sensor for this VTherm.
-        #
-        # The sensor is stored in hass.data so it survives handler recreations.
-        # Re-registering a new entity with the same unique_id on the same
-        # platform causes HA to silently reject it, leaving the stale old
-        # entity in the UI. Instead we always reuse the existing object: the
-        # new handler simply grabs the reference and starts pushing updates to
-        # it via update_from_controller(), which calls async_write_ha_state().
-        hass = self._thermostat.hass
-        vtherm_uid = self._thermostat.unique_id
-        domain_data = hass.data.setdefault(DOMAIN, {})
-        sensor_key = DATA_DEBUG_SENSORS_PREFIX + (vtherm_uid or DOMAIN)
+        self.attach_debug_sensor()
 
-        existing_sensor: PelletDebugSensor | None = domain_data.get(sensor_key)
-        if existing_sensor is not None:
-            # Reuse the already-registered HA entity.
-            self._debug_sensor = existing_sensor
-            _LOGGER.debug(
-                "%s - async_added_to_hass: reusing existing debug sensor",
-                self._thermostat.name,
-            )
-        else:
-            # First time: create and register a fresh sensor.
-            self._debug_sensor = PelletDebugSensor(self._thermostat)
-            domain_data[sensor_key] = self._debug_sensor
-            cb = domain_data.get(DATA_SENSOR_ADD_CB)
-            if cb is not None:
-                cb([self._debug_sensor], update_before_add=True)
-                _LOGGER.debug(
-                    "%s - async_added_to_hass: debug sensor registered",
-                    self._thermostat.name,
-                )
-            else:
-                domain_data.setdefault("pending_sensors", []).append(self._debug_sensor)
-                _LOGGER.debug(
-                    "%s - async_added_to_hass: debug sensor queued "
-                    "(sensor platform not yet ready)",
-                    self._thermostat.name,
-                )
+    def attach_debug_sensor(self) -> None:
+        """Create or reuse this handler's sensor on the active global platform."""
+        if self._removed or self._controller is None:
+            return
+        hass = self._thermostat.hass
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        sensor_key = DATA_DEBUG_SENSORS_PREFIX + (
+            self._thermostat.unique_id or DOMAIN
+        )
+        sensor = domain_data.get(sensor_key)
+        if sensor is None:
+            sensor = PelletDebugSensor(self._thermostat)
+            domain_data[sensor_key] = sensor
+        self._debug_sensor = sensor
+        sensor.update_from_controller(self._controller)
+        callback = domain_data.get(DATA_SENSOR_ADD_CB)
+        registered = domain_data.setdefault(DATA_SENSOR_REGISTERED, set())
+        uid = self._thermostat.unique_id or DOMAIN
+        if callback is not None and uid not in registered:
+            callback([sensor], update_before_add=True)
+            registered.add(uid)
+        elif callback is None and sensor not in domain_data.setdefault(
+            "pending_sensors", []
+        ):
+            domain_data["pending_sensors"].append(sensor)
+
+    def detach_debug_sensor(self) -> None:
+        """Forget a sensor entity after its owning platform has been unloaded."""
+        hass = self._thermostat.hass
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        sensor_key = DATA_DEBUG_SENSORS_PREFIX + (
+            self._thermostat.unique_id or DOMAIN
+        )
+        if domain_data.get(sensor_key) is self._debug_sensor:
+            domain_data.pop(sensor_key, None)
+        domain_data.setdefault(DATA_SENSOR_REGISTERED, set()).discard(
+            self._thermostat.unique_id or DOMAIN
+        )
+        pending = domain_data.get("pending_sensors", [])
+        if self._debug_sensor in pending:
+            pending.remove(self._debug_sensor)
+        self._debug_sensor = None
 
     async def async_startup(self) -> None:
         """Run startup actions after thermostat initialisation."""
@@ -376,7 +433,7 @@ class PelletRegulationHandler:
                     "%s - remove: no running event loop, persistence deferred",
                     self._thermostat.name,
                 )
-                pass
+                return
 
         # Detach the debug sensor (entity stays in HA showing last known state
         # until the handler restarts).
@@ -432,6 +489,22 @@ class PelletRegulationHandler:
         hvac_mode = self._thermostat.vtherm_hvac_mode or "off"
 
         if target is None:
+            if (
+                current is not None
+                and current >= self._controller.safety_room_temp
+                and self._controller.force_safety_off(now)
+            ):
+                _LOGGER.warning(
+                    "%s - safety threshold reached without a target; requesting OFF",
+                    self._thermostat.name,
+                )
+                if self._scheduler is not None and str(hvac_mode).lower() != HVAC_MODE_OFF:
+                    await self._scheduler.start_cycle(
+                        hvac_mode, self._controller.on_percent, True
+                    )
+                    await self._scheduler.cancel_cycle()
+                await self._publish_current_state(now)
+                return
             _LOGGER.debug(
                 "%s - control_heating: no target temperature, skipping",
                 self._thermostat.name,
@@ -446,6 +519,7 @@ class PelletRegulationHandler:
             slope=slope,
             hvac_mode=hvac_mode,
             now=now,
+            allow_turn_on=self._physical_heating_state() is False,
         )
 
         # 2. (prop_algorithm is already the _PropAlgoProxy set in init_algorithm;
@@ -564,23 +638,7 @@ class PelletRegulationHandler:
                 self._controller.is_heating,
             )
 
-        # 5. Publish HA state.
-        self._thermostat.update_custom_attributes()
-        self._thermostat.async_write_ha_state()
-
-        # 6. Persist controller state.
-        if self._store is not None:
-            _LOGGER.debug("%s - control_heating: persisting controller state", self._thermostat.name)
-            await self._store.async_save(self._controller.save_state())
-
-        # 7. Update the debug sensor.
-        if self._debug_sensor is not None:
-            _LOGGER.debug(
-                "%s - control_heating: updating debug sensor", self._thermostat.name
-            )
-            self._debug_sensor.update_from_controller(self._controller, now)
-        else:
-            _LOGGER.debug("%s - control_heating: debug sensor not available", self._thermostat.name)
+        await self._publish_current_state(now)
 
         _LOGGER.debug(
             "%s - control_heating: on_percent=%.1f reason=%s hvac_mode=%s",
@@ -589,6 +647,57 @@ class PelletRegulationHandler:
             self._controller.last_reason,
             hvac_mode,
         )
+
+    def _physical_heating_state(self) -> bool | None:
+        """Return a Duepi burner observation; None means it is not trustworthy."""
+        underlying_list = self._thermostat.entry_infos.get(_CONF_UNDERLYING_LIST) or []
+        climate_entities = [
+            entity_id for entity_id in underlying_list if entity_id.startswith("climate.")
+        ]
+        if not climate_entities:
+            return None
+
+        observations: set[bool] = set()
+        for entity_id in climate_entities:
+            state = self._thermostat.hass.states.get(entity_id)
+            if state is None or state.state in ("unknown", "unavailable"):
+                return None
+            burner_status = state.attributes.get("burner_status")
+            hvac_mode = str(state.state).lower()
+            hvac_action = state.attributes.get("hvac_action")
+            hvac_action = str(hvac_action).lower() if hvac_action is not None else None
+            if burner_status == "Flame On":
+                if hvac_mode != "heat" or hvac_action not in (None, "heating"):
+                    return None
+                observations.add(True)
+            elif burner_status in {
+                "Off",
+                "Eco idle",
+                "Eco Idle",
+                "Cooling down",
+            }:
+                expected_mode = "off" if burner_status == "Off" else "heat"
+                expected_actions = (
+                    (None, "off") if burner_status == "Off" else (None, "idle")
+                )
+                if hvac_mode != expected_mode or hvac_action not in expected_actions:
+                    return None
+                observations.add(False)
+            else:
+                return None
+
+        return observations.pop() if len(observations) == 1 else None
+
+    async def _publish_current_state(self, now: datetime) -> None:
+        """Publish and persist the current controller snapshot."""
+        if self._controller is None:
+            return
+        self._thermostat.update_custom_attributes()
+        self._thermostat.async_write_ha_state()
+        if self._store is not None:
+            await self._store.async_save(self._controller.save_state())
+        if self._debug_sensor is not None:
+            self._debug_sensor.update_from_controller(self._controller, now)
 
     async def on_state_changed(self, changed: bool = True) -> None:
         """React to a thermostat state change."""

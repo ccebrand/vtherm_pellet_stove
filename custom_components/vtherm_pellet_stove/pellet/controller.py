@@ -159,6 +159,7 @@ class PelletRegulationController:
         slope: float | None = None,
         hvac_mode: str = "heat",
         now: datetime | None = None,
+        allow_turn_on: bool = True,
         **kwargs: Any,
     ) -> float:
         """Calcule l'``on_percent`` et met à jour l'état interne.
@@ -194,6 +195,7 @@ class PelletRegulationController:
             slope=slope,
             hvac_mode=hvac_mode,
             now=now,
+            allow_turn_on=allow_turn_on,
         )
         self._last_decision = decision
         self._state.last_reason = decision.reason
@@ -227,6 +229,51 @@ class PelletRegulationController:
             reason="reset",
         )
         self._previous_target = None
+
+    def update_configuration(
+        self,
+        *,
+        hysteresis_on: float,
+        hysteresis_off: float,
+        min_on_percent: float,
+        max_on_percent: float,
+        min_on_duration_min: int,
+        min_off_duration_min: int,
+        cooldown_duration_min: int,
+        safety_room_temp: float,
+        power_control_enabled: bool,
+        power_levels: list[str] | None,
+        power_default_level_index: int,
+        power_boost_enabled: bool,
+        power_boost_duration_min: int,
+    ) -> None:
+        """Apply new settings without replacing state or cycle history."""
+        self._min_on_percent = min_on_percent
+        self._max_on_percent = max_on_percent
+        self._safety_room_temp = safety_room_temp
+        self._power_control_enabled = power_control_enabled
+        self._hysteresis = HysteresisDecider(
+            hysteresis_on=hysteresis_on,
+            hysteresis_off=hysteresis_off,
+        )
+        self._guard = CycleGuard(
+            min_on_duration_min=min_on_duration_min,
+            min_off_duration_min=min_off_duration_min,
+            cooldown_duration_min=cooldown_duration_min,
+        )
+        self._power_mapper = (
+            PowerMapper(
+                power_levels=power_levels,
+                default_level_index=power_default_level_index,
+            )
+            if power_control_enabled and power_levels
+            else None
+        )
+        self._boost_manager = (
+            BoostManager(power_boost_duration_min=power_boost_duration_min)
+            if power_boost_enabled
+            else None
+        )
 
     async def on_cycle_started(
         self,
@@ -278,6 +325,25 @@ class PelletRegulationController:
     def is_heating(self) -> bool:
         """True si le poêle est en chauffe selon l'état interne."""
         return self._state.is_heating
+
+    @property
+    def safety_room_temp(self) -> float:
+        """Configured room-temperature safety limit."""
+        return self._safety_room_temp
+
+    def force_safety_off(self, now: datetime) -> bool:
+        """Record a safety stop when a target temperature is unavailable."""
+        if not self._state.is_heating:
+            return False
+        self._state.is_heating = False
+        self._state.last_off_at = now
+        self._state.last_reason = "safety"
+        self._state.current_level_index = None
+        self._last_decision = PelletDecision(
+            on_percent=self._min_on_percent,
+            reason="safety",
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Calcul interne
@@ -373,6 +439,7 @@ class PelletRegulationController:
         slope: float | None,
         hvac_mode: str,
         now: datetime,
+        allow_turn_on: bool,
     ) -> PelletDecision:
         """Logique de régulation complète (§7.2 du document d'architecture)."""
 
@@ -445,6 +512,12 @@ class PelletRegulationController:
         # ----------------------------------------------------------------
         final_decision = hyst.decision
         final_reason = hyst.reason
+
+        if final_decision == "ON" and not self._state.is_heating and not allow_turn_on:
+            return PelletDecision(
+                on_percent=self._min_on_percent,
+                reason="physical_state_not_confirmed_off",
+            )
 
         if hyst.decision == "OFF" and self._state.is_heating:
             if not self._guard.can_turn_off(now, self._state):

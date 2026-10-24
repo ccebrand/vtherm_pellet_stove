@@ -53,7 +53,7 @@ Il est conçu exclusivement pour les thermostats VTherm en mode `over_switch` ci
 
 ```
 custom_components/vtherm_pellet_stove/
-├── __init__.py          # setup / teardown, enregistrement factory, reload VTherms, forward sensor platform
+├── __init__.py          # setup / teardown, factory, propagation live et plateforme sensor
 ├── manifest.json        # manifeste HA (dépendance : versatile_thermostat)
 ├── config_flow.py       # ConfigFlow (global + par thermostat) + OptionsFlow
 ├── const.py             # DOMAIN, constantes CONF_*, DEFAULT_OPTIONS
@@ -77,10 +77,10 @@ custom_components/vtherm_pellet_stove/
 ### `__init__.py`
 
 - Appelle `VThermAPI.register_prop_algorithm(PelletRegulationFactory())` au `async_setup` / `async_setup_entry`.
-- Appelle `VThermAPI.unregister_prop_algorithm("pellet_regulation")` quand la dernière entrée du plugin est supprimée.
-- Déclenche `_reload_pellet_vtherms()` après un changement d'options pour que les nouveaux paramètres s'appliquent immédiatement.
+- Appelle `VThermAPI.unregister_prop_algorithm("pellet_regulation")` seulement après suppression réelle de la dernière entrée, pas lors d'un unload/reload.
+- Applique Options et Reconfigurer aux handlers vivants du plugin, sans recharger ni modifier les entrées VTherm.
 - Pour l'entrée globale uniquement, forward la plateforme `sensor` (`async_forward_entry_setups`) permettant la création dynamique des capteurs de débogage.
-- Ignore le reload pendant le démarrage de HA pour ne pas perturber la séquence de restauration de VTherm.
+- Après unload/reload de la plateforme globale, détache les anciennes références et réenregistre les capteurs des handlers vivants.
 
 ### `factory.py` — `PelletRegulationFactory`
 
@@ -219,7 +219,8 @@ Démarrage HA
   └─ async_setup_entry (plugin)
        ├─ _register_factory → VThermAPI.register_prop_algorithm
        ├─ entry.async_on_unload → listener _async_update_options
-       └─ (si CoreState.running) _reload_pellet_vtherms
+      ├─ forward sensor si entrée globale
+      └─ applique les options aux handlers déjà vivants, s'il y en a
 
 Démarrage VTherm (après le plugin, dépendance déclarée dans manifest.json)
   └─ factory.create(thermostat_runtime)
@@ -259,15 +260,16 @@ VTherm.async_control_heating
 | ------------------ | --------------------- | ---------------------------------------------------------------- |
 | Defaults globaux   | `DOMAIN`              | Créé automatiquement à la première installation.                 |
 | Par thermostat     | `DOMAIN-<vtherm_uid>` | Surcharge optionnelle pour un thermostat spécifique.             |
-| Options (les deux) | n/a                   | Modifie les paramètres en place ; déclenche le reload du VTherm. |
+| Options (les deux) | n/a                   | Met à jour les handlers vivants sans reload VTherm.              |
 
-### Logique de reload (`_reload_pellet_vtherms`)
+### Portée et application
 
-- Itère sur toutes les entrées de config `versatile_thermostat`.
-- Filtre celles avec `CONF_PROP_FUNCTION == "pellet_regulation"`.
-- Entrée par thermostat : recharge uniquement le VTherm dont le `unique_id` correspond.
-- Entrée globale : recharge tous les VTherms correspondants **sauf** ceux ayant une entrée par thermostat.
-- S'exécute uniquement si `hass.state == CoreState.running`.
+- Une entrée locale remplace toute la configuration globale ; ses clés absentes utilisent les défauts. Sans entrée locale, l'entrée globale s'applique.
+- Options met à jour directement le handler cible (ou les handlers sans entrée locale pour une modification globale). Reconfigurer recharge l'entrée Pellet Stove, puis son setup applique les valeurs au même handler vivant.
+- L'objet d'état, ses horodatages, le proxy, le verrou et le scheduler restent sur le handler existant. Les échéances diagnostiques sont recalculées depuis les horodatages d'origine et les nouvelles durées.
+- Une transition automatique vers ON n'est permise que si chaque underlying climate expose un statut Duepi reconnu comme non-allumé (`Off`, `Eco idle` ou `Cooling down`). État absent, indisponible, inconnu, transitoire ou contradictoire bloque ON. `Flame On` bloque aussi un second ON.
+- Un seuil de sécurité dépassé peut demander OFF même sans consigne. Une commande VTherm déjà en vol reste toutefois sérialisée par son verrou ; aucune garantie d'interruption ou d'ordre matériel prioritaire n'est disponible.
+- Le hook HA `async_remove_entry` désenregistre la factory après suppression réelle. `async_unload_entry` ne le fait pas, car HA l'utilise aussi pendant un reload.
 
 ---
 

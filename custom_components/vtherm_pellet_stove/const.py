@@ -119,6 +119,7 @@ DATA_FACTORY_REGISTERED = "factory_registered"
 
 #: Key in hass.data[DOMAIN] holding the async_add_entities callback for the sensor platform.
 DATA_SENSOR_ADD_CB = "sensor_add_entities"
+DATA_SENSOR_REGISTERED = "registered_debug_sensor_uids"
 
 #: Prefix for keys in hass.data[DOMAIN] holding live PelletDebugSensor instances,
 #: keyed as DATA_DEBUG_SENSORS_PREFIX + vtherm_uid. Sensors are stored here so

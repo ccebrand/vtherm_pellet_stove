@@ -20,7 +20,12 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from vtherm_api.log_collector import get_vtherm_logger
 
-from .const import DOMAIN, DATA_SENSOR_ADD_CB
+from .const import (
+    DATA_HANDLERS,
+    DATA_SENSOR_ADD_CB,
+    DATA_SENSOR_REGISTERED,
+    DOMAIN,
+)
 
 if TYPE_CHECKING:
     from vtherm_api.interfaces import InterfaceThermostatRuntime
@@ -43,6 +48,7 @@ async def async_setup_entry(
     Les entités capteur ne sont pas créées ici mais depuis le handler au
     moment où un VTherm utilisant ``pellet_regulation`` démarre.
     """
+    del entry
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data[DATA_SENSOR_ADD_CB] = async_add_entities
 
@@ -51,6 +57,12 @@ async def async_setup_entry(
     if pending:
         _LOGGER.debug("%d pending pellet debug sensor(s) registered", len(pending))
         async_add_entities(pending, update_before_add=True)
+        domain_data.setdefault(DATA_SENSOR_REGISTERED, set()).update(
+            sensor.vtherm_unique_id or DOMAIN for sensor in pending
+        )
+
+    for handler in domain_data.get(DATA_HANDLERS, {}).values():
+        handler.attach_debug_sensor()
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +99,11 @@ class PelletDebugSensor(SensorEntity):
             manufacturer="VTherm Pellet Stove",
             model="Pellet Regulation",
         )
+
+    @property
+    def vtherm_unique_id(self) -> str | None:
+        """Return the associated VTherm unique ID for lifecycle bookkeeping."""
+        return self._thermostat.unique_id
 
     # ------------------------------------------------------------------
     # Mise à jour depuis le handler
