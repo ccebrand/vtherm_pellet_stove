@@ -406,6 +406,56 @@ async def test_conflicting_physical_status_blocks_automatic_ignition():
     assert handler._controller.is_heating is False
 
 
+async def test_switch_underlying_ignites_without_burner_observation():
+    """A switch underlying (e.g. Shelly relay) has no burner feedback to wait for."""
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=20.0,
+        current_temperature=18.0,
+        vtherm_hvac_mode="heat",
+        underlying_list=["switch.pilote_poele"],
+    )
+    hass.states.async_set("switch.pilote_poele", "off", {})
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    _mock_store(handler)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_awaited_once()
+    assert handler._controller.is_heating is True
+    assert handler._controller.last_reason == "below_on_threshold"
+    # No climate entity to receive fan_mode / preset_mode.
+    hass.services.async_call.assert_not_awaited()
+
+
+async def test_switch_underlying_keeps_min_off_cooldown_guard():
+    hass = _make_hass()
+    thermostat = _make_thermostat(
+        hass,
+        target_temperature=20.0,
+        current_temperature=18.0,
+        vtherm_hvac_mode="heat",
+        underlying_list=["switch.pilote_poele"],
+    )
+    hass.states.async_set("switch.pilote_poele", "off", {})
+    handler = PelletRegulationHandler(thermostat)
+    handler.init_algorithm()
+    _mock_store(handler)
+    handler._controller.state.last_off_at = _now() - timedelta(minutes=5)
+    scheduler = _make_scheduler()
+    handler.on_scheduler_ready(scheduler)
+
+    await handler.control_heating(timestamp=_now())
+
+    scheduler.start_cycle.assert_not_awaited()
+    assert handler._controller.is_heating is False
+    assert handler._controller.last_reason == "locked_off"
+
+
 async def test_safety_stop_without_target_requests_off():
     hass = _make_hass()
     thermostat = _make_thermostat(

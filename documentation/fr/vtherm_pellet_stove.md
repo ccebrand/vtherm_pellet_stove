@@ -20,6 +20,7 @@
     - [Étape 5 — Relier vtherm\_pellet\_stove au VTherm](#étape-5--relier-vtherm_pellet_stove-au-vtherm)
   - [3. Fonctionnement](#3-fonctionnement)
   - [4. Configuration de Versatile Thermostat](#4-configuration-de-versatile-thermostat)
+    - [4.1 Variante — poêle piloté par un relais `switch`](#41-variante--poêle-piloté-par-un-relais-switch)
   - [5. Configuration du plugin](#5-configuration-du-plugin)
     - [5.1 Entrée de defaults globaux](#51-entrée-de-defaults-globaux)
     - [5.2 Entrée par thermostat](#52-entrée-par-thermostat)
@@ -50,7 +51,12 @@
 | [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) | 10.0             |
 | HACS                                                                       | 1.34             |
 
-Votre poêle à pellets **doit être déjà exposé comme entité `climate`** dans Home Assistant (via Duepi EVO, ESPHome, MCZ, EdilKamin, ou toute autre intégration). Ce plugin ne communique **pas** directement avec les poêles.
+Votre poêle à pellets **doit déjà être pilotable depuis Home Assistant**, de l'une de ces deux façons :
+
+- comme **entité `climate`** (via Duepi EVO, ESPHome, MCZ, EdilKamin, ou toute autre intégration) ;
+- par un **relais `switch`** câblé sur son entrée thermostat extérieur (ex. Shelly 1) — voir [§4.1](#41-variante--poêle-piloté-par-un-relais-switch).
+
+Ce plugin ne communique **pas** directement avec les poêles.
 
 ---
 
@@ -100,13 +106,15 @@ Se référer à la [documentation de Versatile Thermostat](https://github.com/jm
 
 1. Aller dans **Paramètres → Appareils et services → Versatile Thermostat → Ajouter**.
 2. Choisir le type de thermostat **`over_switch`**.
-3. Dans le champ **Entité sous-jacente**, sélectionner l'entité `climate` qui contrôle le poêle à pellets (ex. `climate.duepi_evo`).
+3. Dans le champ **Entité sous-jacente**, sélectionner l'entité `climate` qui contrôle le poêle à pellets (ex. `climate.duepi_evo`), ou le `switch` du relais (ex. `switch.pilote_poele`, voir [§4.1](#41-variante--poêle-piloté-par-un-relais-switch)).
 4. Dans le champ **Fonction proportionnelle** (algorithme), sélectionner **`pellet_regulation`**.
 5. Définir la durée du cycle (`cycle_min`) à `60` minutes.
 6. Définir le **Délai d'activation minimal** à `1800` s (30 min) et le **Délai de désactivation minimal** à `1500` s (25 min) — ces valeurs doivent correspondre à `min_on_duration_min` et `min_off_duration_min + cooldown_duration_min`.
 7. Compléter les autres paramètres VTherm (nom, capteur de température, etc.) et sauvegarder.
 
 ### Étape 4 — Ajouter les commandes personnalisées d'allumage et d'extinction
+
+> **Poêle piloté par un relais `switch` :** sauter cette étape. VTherm appelle directement `switch.turn_on` / `switch.turn_off`.
 
 Le mode `over_switch` de VTherm communique avec le poêle via deux appels de service configurables. Ces commandes doivent être renseignées dans la **page de configuration du sous-jacent** du VTherm créé à l'étape précédente :
 
@@ -148,7 +156,7 @@ Si les paramètres par défaut globaux conviennent à ce poêle, aucune étape s
 
 1. **Calcule `on_percent`** — une valeur binaire 0 ou 1 dérivée d'une hystérésis paramétrable sur la température ambiante.
 2. **Applique les garde-fous propres au pellet** — durées minimales de marche/arrêt et délai de refroidissement pour éviter les cycles d'allumage excessifs.
-3. **Envoie les commandes ON/OFF** — le cycle scheduler de VTherm traduit `on_percent` en appels `set_hvac_mode` sur l'entité `climate` du poêle (via `vswitch_on` / `vswitch_off`).
+3. **Envoie les commandes ON/OFF** — le cycle scheduler de VTherm traduit `on_percent` en appels `set_hvac_mode` sur l'entité `climate` du poêle (via `vswitch_on` / `vswitch_off`), ou en `switch.turn_on` / `switch.turn_off` sur un relais.
 4. **Ajuste optionnellement le niveau de puissance** — le plugin appelle `set_fan_mode` ou `set_preset_mode` en fonction de l'écart de température (ΔT) et de la pente.
 
 ```
@@ -178,6 +186,30 @@ Créer un VTherm en mode **`over_switch`** avec les paramètres suivants :
 | **Délai de désactivation minimal** | 1500 (secondes, soit 25 min) — doit correspondre à `min_off_duration_min + cooldown_duration_min` |
 
 > **Pourquoi `over_switch` ?** Le mode `over_switch` de VTherm expose le point d'extension `InterfacePropAlgorithmFactory` qui permet aux plugins externes d'enregistrer des algorithmes de régulation personnalisés. Les options `vswitch_on/off` permettent de cibler n'importe quel domaine HA, y compris `climate`.
+
+### 4.1 Variante — poêle piloté par un relais `switch`
+
+Un poêle sans intégration Home Assistant peut être piloté par un relais à contact sec (ex. Shelly 1) branché sur son entrée **thermostat extérieur** : contact fermé = demande de chauffe, contact ouvert = arrêt.
+
+| Option VTherm                              | Valeur                                                        |
+| ------------------------------------------ | ------------------------------------------------------------- |
+| **Entité sous-jacente**                    | `switch.<relais>` (ex. `switch.pilote_poele`)                 |
+| **Commandes `vswitch_on` / `vswitch_off`** | vides — VTherm appelle `switch.turn_on` / `switch.turn_off`   |
+| **Inverser la commande** (`is_inversed`)   | uniquement si le poêle chauffe quand le contact est **ouvert** |
+
+Les autres options sont celles du tableau ci-dessus.
+
+Côté plugin :
+
+- Désactiver `power_control_enabled` : sans entité `climate`, aucun `fan_mode` ni `preset_mode` ne peut être envoyé et le boost est sans effet.
+- Le relais ne remonte pas l'état réel du brûleur : seuls les garde-fous logiciels (`min_on_duration_min`, `min_off_duration_min`, `cooldown_duration_min`, `safety_room_temp`) protègent le poêle. Les régler au moins aussi longs que les temporisations indiquées dans la notice du poêle.
+
+Câblage et réglages :
+
+- Brancher le **contact du relais** (bornes I et O sur un Shelly 1) sur l'entrée thermostat extérieur, sans jamais y amener de tension.
+- **Ne jamais couper l'alimentation 230 V du poêle avec le relais** : le poêle doit rester alimenté pendant son cycle d'extinction pour évacuer les fumées.
+- Vérifier dans la notice ou le menu du poêle qu'un contact ouvert provoque bien l'extinction (option souvent appelée « Stand-by » ou « Eco ») et pas seulement un passage au minimum de puissance.
+- Régler l'état du relais au retour du courant sur **Off** (Shelly : « Power On Default Mode »).
 
 ---
 
@@ -329,8 +361,10 @@ Le poêle transite entre les états logiques suivants :
 
 ### Le poêle ne s'allume jamais
 
-- Vérifier que `vswitch_on = "set_hvac_mode/hvac_mode:heat"` est bien configuré sur le VTherm.
-- Vérifier que `climate.<poele>` accepte `hvac_mode: heat` (tester manuellement dans Outils de développement → Services).
+- Sous-jacent `climate` : vérifier que `vswitch_on = "set_hvac_mode/hvac_mode:heat"` est bien configuré sur le VTherm.
+- Sous-jacent `climate` : vérifier que `climate.<poele>` accepte `hvac_mode: heat` (tester manuellement dans Outils de développement → Services).
+- Sous-jacent `switch` : vérifier que le relais passe à `on` quand le VTherm demande à chauffer, et que le poêle réagit à son entrée thermostat extérieur.
+- Si `last_reason` vaut `physical_state_not_confirmed_off` dans le capteur de diagnostic : l'entité `climate` ne confirme pas que le brûleur est éteint. L'allumage automatique reste bloqué tant que ce n'est pas le cas. Seules les entités exposant l'attribut `burner_status` (Duepi EVO) peuvent le confirmer ; ce contrôle ne s'applique pas à un relais `switch`.
 - Vérifier que `current_temperature` est disponible sur le VTherm et est inférieure à `target − hysteresis_on`.
 - Vérifier que `min_off_duration_min + cooldown_duration_min` est bien écoulé depuis le dernier arrêt.
 

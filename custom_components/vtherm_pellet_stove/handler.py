@@ -559,7 +559,7 @@ class PelletRegulationHandler:
             slope=slope,
             hvac_mode=hvac_mode,
             now=now,
-            allow_turn_on=self._physical_heating_state() is False,
+            allow_turn_on=self._physical_state_allows_turn_on(),
         )
 
         # 2. (prop_algorithm is already the _PropAlgoProxy set in init_algorithm;
@@ -688,12 +688,27 @@ class PelletRegulationHandler:
             hvac_mode,
         )
 
-    def _physical_heating_state(self) -> bool | None:
-        """Return a Duepi burner observation; None means it is not trustworthy."""
+    def _underlying_climates(self) -> list[str]:
+        """Return the underlying entity IDs that belong to the climate domain."""
         underlying_list = self._thermostat.entry_infos.get(_CONF_UNDERLYING_LIST) or []
-        climate_entities = [
+        return [
             entity_id for entity_id in underlying_list if entity_id.startswith("climate.")
         ]
+
+    def _physical_state_allows_turn_on(self) -> bool:
+        """Return True when the burner observation does not veto an ignition.
+
+        Only climate underlyings expose a burner observation.  A switch
+        underlying (e.g. a Shelly relay wired to the stove thermostat input)
+        has none, so the software guards alone decide.
+        """
+        if not self._underlying_climates():
+            return True
+        return self._physical_heating_state() is False
+
+    def _physical_heating_state(self) -> bool | None:
+        """Return a Duepi burner observation; None means it is not trustworthy."""
+        climate_entities = self._underlying_climates()
         if not climate_entities:
             return None
 
@@ -794,10 +809,7 @@ class PelletRegulationHandler:
             return  # Already at the correct level — no service call needed.
 
         attribute = self._opts.get(CONF_POWER_CONTROL_ATTRIBUTE, "fan_mode")
-        underlying_list = self._thermostat.entry_infos.get(_CONF_UNDERLYING_LIST) or []
-        climate_entities = [
-            eid for eid in underlying_list if eid.startswith("climate.")
-        ]
+        climate_entities = self._underlying_climates()
 
         _LOGGER.debug(
             "%s - _apply_power_level: applying %s=%s to %s entities",

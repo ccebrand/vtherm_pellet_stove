@@ -26,7 +26,7 @@
 
 `vtherm_pellet_stove` est une **intégration HA distribuable via HACS** qui s'enregistre comme algorithme proportionnel externe (`pellet_regulation`) dans l'interface publique [vtherm_api](https://github.com/KipK/vtherm_api).
 
-Il est conçu exclusivement pour les thermostats VTherm en mode `over_switch` ciblant une entité `climate` (le poêle à pellets). Le cycle scheduler intégré de VTherm gère la temporalité réelle ON/OFF ; ce plugin fournit uniquement le **calcul d'`on_percent`** et l'ajustement optionnel du niveau de puissance.
+Il est conçu exclusivement pour les thermostats VTherm en mode `over_switch` ciblant le poêle à pellets, soit comme entité `climate`, soit comme relais `switch` câblé sur l'entrée thermostat extérieur du poêle. L'allumage automatique est bloqué tant qu'une entité `climate` sous-jacente ne confirme pas, via `burner_status`, que le brûleur est éteint (`physical_state_not_confirmed_off`) ; un sous-jacent `switch` n'expose aucune observation du brûleur, seuls les garde-fous logiciels s'appliquent. Le cycle scheduler intégré de VTherm gère la temporalité réelle ON/OFF ; ce plugin fournit uniquement le **calcul d'`on_percent`** et l'ajustement optionnel du niveau de puissance.
 
 ```
 ┌────────────────────────────────────┐

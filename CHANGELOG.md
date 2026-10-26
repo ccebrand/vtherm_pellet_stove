@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A VTherm whose underlying entity is a `switch` relay (e.g. a Shelly 1 wired to the stove thermostat input) never ignited the stove: the burner-state check introduced in 1.0.1 blocked ignition when no `climate` entity could report it (`physical_state_not_confirmed_off`). Switch underlyings now rely on the software guards only.
+
 ## [1.0.0] — 2026-10-22
 
 ### Added

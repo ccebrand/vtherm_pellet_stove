@@ -22,7 +22,7 @@
 
 ## What is vtherm_pellet_stove?
 
-`vtherm_pellet_stove` registers a new proportional algorithm named **`pellet_regulation`** in the [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) (VTherm) API. It extends VTherm `over_switch` thermostats that target a `climate` entity (e.g. a Duepi EVO, an ESPHome stove, MCZ, EdilKamin, …).
+`vtherm_pellet_stove` registers a new proportional algorithm named **`pellet_regulation`** in the [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) (VTherm) API. It extends VTherm `over_switch` thermostats that target either a `climate` entity (e.g. a Duepi EVO, an ESPHome stove, MCZ, EdilKamin, …) or a `switch` relay wired to the stove's external thermostat input (e.g. a Shelly 1).
 
 Key features:
 
@@ -39,8 +39,8 @@ Key features:
 The plugin relies on the public [vtherm_api](https://github.com/KipK/vtherm_api). Once installed:
 
 1. Configure Versatile Thermostat in **`over_switch`** mode.
-2. Set the underlying entity to your stove's `climate.*` entity.
-3. Configure `vswitch_on = "set_hvac_mode/hvac_mode:heat"` and `vswitch_off = "set_hvac_mode/hvac_mode:off"`.
+2. Set the underlying entity to your stove's `climate.*` entity, or to the `switch.*` relay wired to its thermostat input.
+3. For a `climate` entity, configure `vswitch_on = "set_hvac_mode/hvac_mode:heat"` and `vswitch_off = "set_hvac_mode/hvac_mode:off"`. Leave them empty for a `switch`.
 4. Select **`pellet_regulation`** as the proportional function.
 
 ## Installation

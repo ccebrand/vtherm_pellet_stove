@@ -20,6 +20,7 @@
     - [Step 5 — Link vtherm\_pellet\_stove to the VTherm](#step-5--link-vtherm_pellet_stove-to-the-vtherm)
   - [3. How it works](#3-how-it-works)
   - [4. Configuring Versatile Thermostat](#4-configuring-versatile-thermostat)
+    - [4.1 Variant — stove driven by a `switch` relay](#41-variant--stove-driven-by-a-switch-relay)
   - [5. Plugin configuration](#5-plugin-configuration)
     - [5.1 Global defaults entry](#51-global-defaults-entry)
     - [5.2 Per-thermostat entry](#52-per-thermostat-entry)
@@ -50,7 +51,12 @@
 | [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) | 10.0            |
 | HACS                                                                       | 1.34            |
 
-Your pellet stove **must already be exposed as a `climate` entity** in Home Assistant (via Duepi EVO, ESPHome, MCZ, EdilKamin, or any other integration). This plugin does **not** communicate directly with stoves.
+Your pellet stove **must already be controllable from Home Assistant**, in one of two ways:
+
+- as a **`climate` entity** (via Duepi EVO, ESPHome, MCZ, EdilKamin, or any other integration);
+- through a **`switch` relay** wired to its external thermostat input (e.g. a Shelly 1) — see [§4.1](#41-variant--stove-driven-by-a-switch-relay).
+
+This plugin does **not** communicate directly with stoves.
 
 ---
 
@@ -100,13 +106,15 @@ Refer to the [Versatile Thermostat documentation](https://github.com/jmcollin78/
 
 1. Go to **Settings → Devices & Services → Versatile Thermostat → Add**.
 2. Choose thermostat type **`over_switch`**.
-3. In the **Underlying entity** field, select the `climate` entity that controls your pellet stove (e.g. `climate.duepi_evo`).
+3. In the **Underlying entity** field, select the `climate` entity that controls your pellet stove (e.g. `climate.duepi_evo`), or the relay's `switch` (e.g. `switch.pilote_poele`, see [§4.1](#41-variant--stove-driven-by-a-switch-relay)).
 4. In the **Proportional function** (algorithm) field, select **`pellet_regulation`**.
 5. Set the cycle duration (`cycle_min`) to `60` minutes.
 6. Set **Minimal activation delay** to `1800` s (30 min) and **Minimal deactivation delay** to `1500` s (25 min) — these should align with `min_on_duration_min` and `min_off_duration_min + cooldown_duration_min`.
 7. Complete the remaining VTherm settings (name, temperature sensor, etc.) and save.
 
 ### Step 4 — Add the custom ON/OFF commands
+
+> **Stove driven by a `switch` relay:** skip this step. VTherm calls `switch.turn_on` / `switch.turn_off` directly.
 
 VTherm's `over_switch` mode sends two configurable service calls to the stove. These must be set on the **underlying entity** configuration page of the VTherm you just created:
 
@@ -148,7 +156,7 @@ If the global default parameters suit this stove, no additional step is required
 
 1. **Calculates `on_percent`** — a binary 0 or 1 value derived from a parameterizable hysteresis on the room temperature.
 2. **Applies pellet-specific guard-rails** — minimum on/off durations and a cooldown delay to prevent excessive ignition cycles.
-3. **Sends ON/OFF commands** — VTherm's cycle scheduler translates `on_percent` into `set_hvac_mode` calls on the stove's `climate` entity (via `vswitch_on` / `vswitch_off`).
+3. **Sends ON/OFF commands** — VTherm's cycle scheduler translates `on_percent` into `set_hvac_mode` calls on the stove's `climate` entity (via `vswitch_on` / `vswitch_off`), or into `switch.turn_on` / `switch.turn_off` on a relay.
 4. **Optionally adjusts the power level** — the plugin calls `set_fan_mode` or `set_preset_mode` on the stove according to the temperature gap (ΔT) and slope.
 
 ```
@@ -178,6 +186,30 @@ Create a VTherm in **`over_switch`** mode and set the following options:
 | **Minimal deactivation delay**   | 1500 (seconds, i.e. 25 min) — must match `min_off_duration_min + cooldown_duration_min` |
 
 > **Why `over_switch`?** VTherm's `over_switch` mode exposes the `InterfacePropAlgorithmFactory` extension point that allows external plugins to register custom regulation algorithms. The `vswitch_on/off` options let you target any HA domain, including `climate`.
+
+### 4.1 Variant — stove driven by a `switch` relay
+
+A stove with no Home Assistant integration can be driven by a dry-contact relay (e.g. a Shelly 1) wired to its **external thermostat** input: closed contact = heat demand, open contact = stop.
+
+| VTherm option                               | Value                                                      |
+| ------------------------------------------- | ---------------------------------------------------------- |
+| **Underlying entity**                       | `switch.<relay>` (e.g. `switch.pilote_poele`)              |
+| **`vswitch_on` / `vswitch_off` commands**   | empty — VTherm calls `switch.turn_on` / `switch.turn_off`  |
+| **Invert the command** (`is_inversed`)      | only if the stove heats while the contact is **open**      |
+
+The other options are those of the table above.
+
+On the plugin side:
+
+- Disable `power_control_enabled`: without a `climate` entity, no `fan_mode` or `preset_mode` can be sent and boost has no effect.
+- The relay does not report the actual burner state: only the software guards (`min_on_duration_min`, `min_off_duration_min`, `cooldown_duration_min`, `safety_room_temp`) protect the stove. Set them at least as long as the delays given in the stove manual.
+
+Wiring and settings:
+
+- Wire the **relay contact** (terminals I and O on a Shelly 1) to the external thermostat input, never feeding any voltage into it.
+- **Never cut the stove's 230 V supply with the relay**: the stove must stay powered during its shutdown cycle to clear the flue gases.
+- Check in the stove manual or menu that an open contact actually shuts the stove down (option often called "Stand-by" or "Eco"), rather than only dropping to minimum power.
+- Set the relay's power-on state to **Off** (Shelly: "Power On Default Mode").
 
 ---
 
@@ -329,8 +361,10 @@ The stove transitions through the following logical states:
 
 ### The stove never turns on
 
-- Check that `vswitch_on = "set_hvac_mode/hvac_mode:heat"` is set on the VTherm.
-- Verify that `climate.<stove>` accepts `hvac_mode: heat` (test manually in Developer Tools → Services).
+- `climate` underlying: check that `vswitch_on = "set_hvac_mode/hvac_mode:heat"` is set on the VTherm.
+- `climate` underlying: verify that `climate.<stove>` accepts `hvac_mode: heat` (test manually in Developer Tools → Services).
+- `switch` underlying: check that the relay turns `on` when the VTherm requests heat, and that the stove reacts to its external thermostat input.
+- If the diagnostic sensor shows `last_reason: physical_state_not_confirmed_off`: the `climate` entity does not confirm that the burner is off. Automatic ignition stays blocked until it does. Only entities exposing the `burner_status` attribute (Duepi EVO) can confirm it; this check does not apply to a `switch` relay.
 - Check that `current_temperature` is available on the VTherm and is below `target − hysteresis_on`.
 - Verify that `min_off_duration_min + cooldown_duration_min` has elapsed since the last OFF.
 
